@@ -1,0 +1,23 @@
+      * Sample fixed-format COBOL program for graphify tests.
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SAMPLEPGM.
+       ENVIRONMENT DIVISION.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       COPY CUSTREC.
+       01 WS-COUNTER PIC 9(4) VALUE ZERO.
+       PROCEDURE DIVISION.
+       MAIN-SECTION SECTION.
+       MAIN-PARA.
+           DISPLAY 'STARTING'.
+           PERFORM INIT-PARA.
+           PERFORM PROCESS-PARA THRU PROCESS-EXIT.
+           CALL 'SUBPGM01' USING WS-COUNTER.
+           STOP RUN.
+       INIT-PARA.
+           MOVE ZERO TO WS-COUNTER.
+       PROCESS-PARA.
+           ADD 1 TO WS-COUNTER.
+           CALL 'SUBPGM02'.
+       PROCESS-EXIT.
+           EXIT.

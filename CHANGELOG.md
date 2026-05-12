@@ -2,6 +2,13 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.7.16 (unreleased)
+
+- Feat: mainframe code support — COBOL (`.cob .cbl .ccp .cobol .cob85 .scbl`), COBOL copybooks (`.cpy .copy .cbk`), JCL (`.jcl`), PL/I (`.pli .pl1`), REXX (`.rexx .rex`), and DB2 DDL (`.ddl`, routed to the SQL extractor)
+- Feat: COBOL is parsed with the [ProLeap](https://github.com/uwol/proleap-cobol-parser) COBOL 85 ANTLR4 grammar — the `.g4` plus the ANTLR-generated lexer/parser/listener are vendored under `graphify/_antlr/cobol85/`; install the runtime with `pip install graphifyy[mainframe]`. Extracts programs, sections, paragraphs, `CALL`/`PERFORM` call edges, and `COPY` dependency edges; handles both fixed- and free-format source via a built-in preprocessing pass
+- Feat: when `antlr4-python3-runtime` is not installed (or the grammar parse recovers nothing) `extract_cobol` falls back to a dependency-free regex extractor with the same node/edge shape
+- Feat: JCL extraction emits jobs, steps (`EXEC PGM=`/`PROC=`), DD dataset reads/writes, and `INCLUDE` members; PL/I emits procedures/entries, `%INCLUDE` members, and `CALL` edges; REXX emits internal routines and `CALL` edges
+
 ## 0.7.15 (2026-05-11)
 
 - Fix: `-h`/`--help`/`-?` in any position now stops execution — previously `graphify cursor install --help` silently installed into Cursor; `graphify benchmark --help` crashed with FileNotFoundError (#821)

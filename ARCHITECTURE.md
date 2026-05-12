@@ -63,6 +63,14 @@ Every extractor returns:
 4. Add the tree-sitter package to `pyproject.toml` dependencies.
 5. Add a fixture file to `tests/fixtures/` and tests to `tests/test_languages.py`.
 
+Not every language has a tree-sitter grammar. Some extractors are pure-regex
+(Dart, Blade, Lazarus forms, JCL, PL/I, REXX). COBOL uses the ProLeap COBOL 85
+ANTLR4 grammar: the `.g4` source plus the ANTLR-generated Python lexer/parser/
+listener are vendored under `graphify/_antlr/cobol85/`, the runtime
+(`antlr4-python3-runtime`) is the optional `mainframe` extra, and `extract_cobol`
+falls back to a regex extractor when the runtime is absent or the parse recovers
+nothing. To regenerate the COBOL parser, see `graphify/_antlr/cobol85/__init__.py`.
+
 ## Security
 
 All external input passes through `graphify/security.py` before use:
