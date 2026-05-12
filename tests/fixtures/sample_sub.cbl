@@ -1,0 +1,11 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SUBPGM01.
+       DATA DIVISION.
+       LINKAGE SECTION.
+       01 LK-COUNTER PIC 9(4).
+       PROCEDURE DIVISION USING LK-COUNTER.
+       VALIDATE-PARA.
+           IF LK-COUNTER > 1000
+               CALL 'ERRLOG'
+           END-IF.
+           GOBACK.

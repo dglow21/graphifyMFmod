@@ -64,12 +64,17 @@ Every extractor returns:
 5. Add a fixture file to `tests/fixtures/` and tests to `tests/test_languages.py`.
 
 Not every language has a tree-sitter grammar. Some extractors are pure-regex
-(Dart, Blade, Lazarus forms, JCL, PL/I, REXX). COBOL uses the ProLeap COBOL 85
-ANTLR4 grammar: the `.g4` source plus the ANTLR-generated Python lexer/parser/
-listener are vendored under `graphify/_antlr/cobol85/`, the runtime
-(`antlr4-python3-runtime`) is the optional `mainframe` extra, and `extract_cobol`
-falls back to a regex extractor when the runtime is absent or the parse recovers
-nothing. To regenerate the COBOL parser, see `graphify/_antlr/cobol85/__init__.py`.
+(Dart, Blade, Lazarus forms, JCL, PL/I, REXX). COBOL uses a two-layer design:
+`_cobol_regex_extract` is a robust structural extractor (handles fixed/free
+format, continuation lines, `COPY`/`REPLACE`/directives, embedded SQL/CICS, and
+IBM/GnuCOBOL dialect extensions) and is always the trusted base; when the
+optional `antlr4-python3-runtime` (`mainframe` extra) is present, the source is
+*also* parsed with the vendored ProLeap COBOL 85 ANTLR4 grammar — the `.g4` plus
+the ANTLR-generated Python lexer/parser/listener under `graphify/_antlr/cobol85/`
+— and `_mf_merge` folds its precise paragraph-scoped call edges into the base
+(ANTLR-only "definitions" are discarded, since a partial parse can mis-tokenise
+statements as paragraph names). To regenerate the COBOL parser, see
+`graphify/_antlr/cobol85/__init__.py`.
 
 ## Security
 

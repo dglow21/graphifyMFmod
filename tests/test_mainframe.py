@@ -12,7 +12,8 @@ from graphify.extract import (
     extract_pli,
     extract_rexx,
     _cobol_regex_extract,
-    _normalize_cobol_source,
+    _decolumn_cobol,
+    _strip_cobol_for_grammar,
 )
 from graphify.validate import validate_extraction
 
@@ -81,14 +82,18 @@ def test_cobol_copy_dependency():
 
 def test_cobol_regex_fallback_matches_structure():
     src = (FIXTURES / "sample.cbl").read_text()
-    normalized, copybooks = _normalize_cobol_source(src)
-    r = _cobol_regex_extract(FIXTURES / "sample.cbl", src, normalized, copybooks)
+    deco = _decolumn_cobol(src)
+    _, copybooks = _strip_cobol_for_grammar(deco)
+    r = _cobol_regex_extract(FIXTURES / "sample.cbl", deco, copybooks)
     _assert_schema_ok(r)
     labels = _labels(r)
     assert "SAMPLEPGM" in labels
     assert "MAIN-PARA" in labels
     assert ("sample.cbl", "CUSTREC") in _edges(r, "includes")
     assert any(t == "SUBPGM01" for _, t in _edges(r, "calls"))
+    # CALL/PERFORM should be attributed to the enclosing paragraph, not the program.
+    assert ("MAIN-PARA", "SUBPGM01") in _edges(r, "calls")
+    assert ("MAIN-PARA", "INIT-PARA") in _edges(r, "calls")
 
 
 @pytest.mark.skipif(not _ANTLR_AVAILABLE, reason="antlr4-python3-runtime not installed")
@@ -98,6 +103,114 @@ def test_cobol_uses_antlr_when_available():
     r = extract_cobol(FIXTURES / "sample.cbl")
     calls = _edges(r, "calls")
     assert ("MAIN-PARA", "SUBPGM01") in calls
+
+
+# ── COBOL: real-world dialect features (AUTHOR entries, embedded SQL/CICS, GO TO) ─
+
+def test_cobol_db2_no_error_despite_comment_entries():
+    r = extract_cobol(FIXTURES / "sample_db2.cbl")
+    assert "error" not in r
+    _assert_schema_ok(r)
+
+
+def test_cobol_db2_finds_all_paragraphs():
+    # AUTHOR./INSTALLATION./REMARKS. free text must not derail paragraph extraction.
+    r = extract_cobol(FIXTURES / "sample_db2.cbl")
+    labels = _labels(r)
+    for name in ("SAMPLE2", "0100-INIT", "0200-FETCH-CUST", "0300-POST", "0999-ERROR"):
+        assert name in labels
+
+
+def test_cobol_db2_embedded_sql_and_cics():
+    r = extract_cobol(FIXTURES / "sample_db2.cbl")
+    includes = _edges(r, "includes")
+    assert any(t == "SQLCA" for _, t in includes)        # EXEC SQL INCLUDE
+    assert any(t == "CUSTROW" for _, t in includes)
+    uses = _edges(r, "uses")
+    assert any(t == "ACMEDB.CUSTOMER_TBL" for _, t in uses)   # EXEC SQL ... FROM/UPDATE
+    assert any(t == "ACMEDB.ACCOUNT_TBL" for _, t in uses)    # EXEC SQL ... JOIN
+    assert any(t == "CONFMAP" for _, t in uses)               # EXEC CICS SEND MAP
+    calls = _edges(r, "calls")
+    assert any(t == "POSTPGM" for _, t in calls)              # EXEC CICS LINK PROGRAM
+    assert any(t == "AUDITLOG" for _, t in calls)             # static CALL 'literal'
+    # "DISPLAY 'PLEASE CALL SUPPORT ...'" must NOT produce a CALL edge.
+    assert all(t != "SUPPORT" for _, t in calls)
+
+
+def test_cobol_db2_go_to_edge():
+    r = extract_cobol(FIXTURES / "sample_db2.cbl")
+    assert ("0200-FETCH-CUST", "0999-ERROR") in _edges(r, "calls")
+
+
+def test_cobol_db2_sql_scoped_to_paragraph():
+    # Embedded-SQL "uses" edges should be attributed to the enclosing paragraph.
+    r = extract_cobol(FIXTURES / "sample_db2.cbl")
+    uses = _edges(r, "uses")
+    assert ("0200-FETCH-CUST", "ACMEDB.CUSTOMER_TBL") in uses
+
+
+# ── Cross-file linking through the full extract() pipeline ────────────────────
+
+def test_cobol_cross_file_call_links_to_program():
+    from graphify.extract import extract
+    from graphify.build import build_from_json
+    paths = [FIXTURES / "sample.cbl", FIXTURES / "sample_sub.cbl", FIXTURES / "sample_run.jcl"]
+    ex = extract(paths, cache_root=FIXTURES, parallel=False)
+    G = build_from_json(ex, directed=True)
+    lab = {n: d.get("label") for n, d in G.nodes(data=True)}
+    edges = {(lab.get(s), lab.get(t), d.get("relation")) for s, t, d in G.edges(data=True)}
+    # sample.cbl: MAIN-PARA CALLs 'SUBPGM01'; sample_sub.cbl: PROGRAM-ID. SUBPGM01.
+    assert ("MAIN-PARA", "SUBPGM01", "calls") in edges
+    # sample_run.jcl: a step EXECs PGM=SUBPGM01 — links to the same program node.
+    assert any(t == "SUBPGM01" and r_ == "executes" for _, t, r_ in edges)
+    # SUBPGM01 must be a single node (CALL target, PGM= target and PROGRAM-ID merge).
+    assert len([n for n, l in lab.items() if l == "SUBPGM01"]) == 1
+    # The merged program node should have its own paragraph defined.
+    assert ("SUBPGM01", "VALIDATE-PARA", "defines") in edges
+
+
+# ── JCL in-stream procedures ──────────────────────────────────────────────────
+
+def test_jcl_instream_proc():
+    r = extract_jcl(FIXTURES / "sample_proc.jcl")
+    _assert_schema_ok(r)
+    labels = _labels(r)
+    assert "LOADPROC" in labels                                # in-stream PROC defined
+    assert ("sample_proc.jcl", "LOADPROC") in _edges(r, "defines")
+    assert ("LOADPROC", "PLOAD") in _edges(r, "defines")       # step belongs to the PROC
+    assert ("RUNLOAD", "LOADPROC") in _edges(r, "calls")       # invoked via EXEC LOADPROC
+    # DSN on a DD continuation line is still captured.
+    assert any(t == "PROD.AUDIT.LOG" for _, t in _edges(r, "reads"))
+
+
+# ── PL/I FETCH and REXX function-style calls (inline source) ──────────────────
+
+def test_pli_fetch_edge(tmp_path):
+    p = tmp_path / "x.pli"
+    p.write_text(
+        " MAINP: PROCEDURE OPTIONS(MAIN);\n"
+        "   FETCH DYNMOD;\n"
+        "   CALL DYNMOD;\n"
+        " END MAINP;\n"
+    )
+    r = extract_pli(p)
+    calls = {t for _, t in _edges(r, "calls")}
+    assert "DYNMOD" in calls
+
+
+def test_rexx_internal_function_call(tmp_path):
+    p = tmp_path / "x.rexx"
+    p.write_text(
+        "/* REXX */\n"
+        "say DOUBLE(21)\n"
+        "exit\n"
+        "DOUBLE: procedure\n"
+        "  parse arg n\n"
+        "  return n * 2\n"
+    )
+    r = extract_rexx(p)
+    assert "DOUBLE" in _labels(r)
+    assert any(t == "DOUBLE" for _, t in _edges(r, "calls"))
 
 
 def test_cobol_handles_free_format():
@@ -110,9 +223,13 @@ def test_cobol_handles_free_format():
         "    CALL 'OTHERPGM'.\n"
         "    STOP RUN.\n"
     )
-    norm, _ = _normalize_cobol_source(src)
+    deco = _decolumn_cobol(src)
     # Free-format detection must not strip columns 1-7 here.
-    assert "IDENTIFICATION DIVISION." in norm
+    assert "IDENTIFICATION DIVISION." in deco
+    r = _cobol_regex_extract(Path("free.cbl"), deco, [])
+    assert "FREEPGM" in _labels(r)
+    assert "MAIN-PARA" in _labels(r)
+    assert ("MAIN-PARA", "OTHERPGM") in _edges(r, "calls")
 
 
 # ── COBOL copybook ────────────────────────────────────────────────────────────

@@ -136,7 +136,7 @@ To remove graphify from all platforms at once: `graphify uninstall` (add `--purg
 | Type | Extensions |
 |------|-----------|
 | Code (33 languages) | `.py .ts .js .jsx .tsx .mjs .go .rs .java .c .cpp .h .hpp .rb .cs .kt .scala .php .swift .lua .luau .zig .ps1 .ex .exs .m .mm .jl .vue .svelte .groovy .gradle .dart .v .sv .sql .f .f90 .f95 .f03 .f08 .pas .pp .dpr .dpk .lpr .inc .dfm .lfm .lpk` |
-| Mainframe | COBOL `.cob .cbl .ccp .cobol .cob85 .scbl`, copybooks `.cpy .copy .cbk`, JCL `.jcl`, PL/I `.pli .pl1`, REXX `.rexx .rex`, DB2 DDL `.ddl`. COBOL is parsed with the [ProLeap](https://github.com/uwol/proleap-cobol-parser) COBOL 85 ANTLR4 grammar when `pip install graphifyy[mainframe]` is installed; otherwise a built-in regex fallback is used. |
+| Mainframe | COBOL `.cob .cbl .ccp .cobol .cob85 .scbl`, copybooks `.cpy .copy .cbk`, JCL `.jcl`, PL/I `.pli .pl1`, REXX `.rexx .rex`, DB2 DDL `.ddl`. COBOL extraction (programs, paragraphs, `CALL`/`PERFORM`/`GO TO`, `COPY`, embedded `EXEC SQL`/`EXEC CICS`) works out of the box via a built-in structural extractor; install `pip install graphifyy[mainframe]` to additionally parse with the [ProLeap](https://github.com/uwol/proleap-cobol-parser) COBOL 85 ANTLR4 grammar for precise paragraph-scoped call attribution. JCL/PL/I/REXX use lightweight extractors; `.ddl` is routed to the SQL extractor. |
 | Docs | `.md .mdx .qmd .html .txt .rst .yaml .yml` |
 | Office | `.docx .xlsx` (requires `pip install graphifyy[office]`) |
 | Google Workspace | `.gdoc .gsheet .gslides` (opt-in; requires `gws` auth and `--google-workspace`; Sheets need `pip install graphifyy[google]`) |

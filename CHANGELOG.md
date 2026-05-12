@@ -5,9 +5,11 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 ## 0.7.16 (unreleased)
 
 - Feat: mainframe code support — COBOL (`.cob .cbl .ccp .cobol .cob85 .scbl`), COBOL copybooks (`.cpy .copy .cbk`), JCL (`.jcl`), PL/I (`.pli .pl1`), REXX (`.rexx .rex`), and DB2 DDL (`.ddl`, routed to the SQL extractor)
-- Feat: COBOL is parsed with the [ProLeap](https://github.com/uwol/proleap-cobol-parser) COBOL 85 ANTLR4 grammar — the `.g4` plus the ANTLR-generated lexer/parser/listener are vendored under `graphify/_antlr/cobol85/`; install the runtime with `pip install graphifyy[mainframe]`. Extracts programs, sections, paragraphs, `CALL`/`PERFORM` call edges, and `COPY` dependency edges; handles both fixed- and free-format source via a built-in preprocessing pass
-- Feat: when `antlr4-python3-runtime` is not installed (or the grammar parse recovers nothing) `extract_cobol` falls back to a dependency-free regex extractor with the same node/edge shape
-- Feat: JCL extraction emits jobs, steps (`EXEC PGM=`/`PROC=`), DD dataset reads/writes, and `INCLUDE` members; PL/I emits procedures/entries, `%INCLUDE` members, and `CALL` edges; REXX emits internal routines and `CALL` edges
+- Feat: COBOL extraction emits programs, sections, paragraphs, `CALL`/`PERFORM`/`GO TO` call edges (attributed to the enclosing paragraph), `COPY` dependency edges, embedded `EXEC SQL` table/`INCLUDE` references and `EXEC CICS LINK`/`XCTL`/`SEND MAP` references — handling both fixed- and free-format source, COBOL continuation lines, `REPLACE`/compiler directives, and IDENTIFICATION-DIVISION comment entries
+- Feat: COBOL uses a robust regex-based structural extractor as its base layer; when the optional `antlr4-python3-runtime` is installed the file is *also* parsed with the vendored [ProLeap](https://github.com/uwol/proleap-cobol-parser) COBOL 85 ANTLR4 grammar (`.g4` + ANTLR-generated lexer/parser/listener under `graphify/_antlr/cobol85/`) and its precise paragraph-scoped call edges are merged in. Install with `pip install graphifyy[mainframe]`
+- Feat: COBOL copybook extraction emits 01/77-level record names and nested `COPY` edges; the copybook file node is keyed on its member name so `COPY` from programs links to it
+- Feat: JCL extraction emits jobs, in-stream procedures (`PROC`/`PEND`), steps (`EXEC PGM=`/`PROC=`, including `EXEC procname`), DD dataset reads/writes (including DSN on continuation lines), and `INCLUDE` members; PL/I emits procedures/entries, `%INCLUDE` members, `FETCH` and `CALL` edges; REXX emits internal routines plus `CALL` and internal-function-call edges
+- Feat: COBOL `PROGRAM-ID`, JCL `PGM=`/`PROC=` targets, and `CALL 'literal'` targets share a stable node id, so JCL → program → sub-program call chains and `COPY`/`%INCLUDE` dependencies link up across files
 
 ## 0.7.15 (2026-05-11)
 

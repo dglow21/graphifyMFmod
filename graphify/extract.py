@@ -1,5 +1,6 @@
 """Deterministic structural extraction from source code using tree-sitter. Outputs nodes+edges dicts."""
 from __future__ import annotations
+import bisect
 import importlib
 import json
 import os
@@ -2379,7 +2380,7 @@ def extract_dart(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-# ── Mainframe: COBOL (ProLeap ANTLR4 grammar + regex fallback), JCL, PL/I, REXX ──
+# ── Mainframe: COBOL (ProLeap ANTLR4 grammar + regex), JCL, PL/I, REXX ──────────
 
 def _mf_node(nid: str, label: str, path, loc: str | None = None, ftype: str = "code") -> dict:
     return {"id": nid, "label": label, "file_type": ftype,
@@ -2401,40 +2402,74 @@ def _mf_loc(ctx) -> str | None:
 
 
 def _mf_self_consistent(nodes: list, edges: list) -> list:
-    """Drop edges whose endpoints aren't in this extraction's node set.
-
-    COBOL CALL targets, COPY members and PERFORM targets are all emitted as
-    nodes here, so anything left dangling is a genuine external/typo reference
-    that build_graph would discard anyway."""
+    """Drop edges whose endpoints aren't in this extraction's node set, and
+    deduplicate by (source, relation, target). CALL/COPY/PERFORM targets are all
+    emitted as nodes here, so anything left dangling is a genuine external/typo
+    reference that build_graph would discard anyway."""
     ids = {n["id"] for n in nodes}
-    return [e for e in edges if e["source"] in ids and e["target"] in ids]
+    out, seen = [], set()
+    for e in edges:
+        if e["source"] not in ids or e["target"] not in ids:
+            continue
+        key = (e["source"], e["relation"], e["target"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
+
+
+def _mf_merge(base: dict, extra: dict | None) -> dict:
+    """Combine the regex COBOL extractor (the trustworthy base — robust against
+    fixed/free format and IBM/GnuCOBOL dialect extensions) with the ProLeap ANTLR
+    parse (which adds precise paragraph-scoped call attribution when it parses
+    cleanly). Definitions discovered only by the ANTLR pass are *not* trusted —
+    on a partial/recovered parse it can mistake mis-tokenised statements for
+    paragraph names — so its ``defines`` targets are kept only when the regex base
+    already found them. Its call/use edges are merged and then filtered to the
+    base's node set, so a bad parse can never inject spurious nodes."""
+    if not extra:
+        return base
+    base_ids = {n["id"] for n in base["nodes"]}
+    extra_def_targets = {e["target"] for e in extra.get("edges", []) if e["relation"] == "defines"}
+    nodes = list(base["nodes"])
+    have = set(base_ids)
+    for n in extra.get("nodes", []):
+        if n["id"] in have:
+            continue
+        if n["id"] in extra_def_targets:
+            continue  # an ANTLR-only "definition" — don't trust it over the regex base
+        nodes.append(n)
+        have.add(n["id"])
+    return {"nodes": nodes, "edges": _mf_self_consistent(nodes, list(base["edges"]) + list(extra.get("edges", [])))}
 
 
 # COBOL column-7 indicators that mean "this line is not code".
 _COBOL_NONCODE_INDICATORS = frozenset("*/$")
-# Words that follow PERFORM but are not procedure names.
+# Words that follow PERFORM but are not procedure names (inline PERFORM clauses).
 _COBOL_NON_PROCEDURE = frozenset({
     "UNTIL", "VARYING", "TIMES", "TEST", "WITH", "BEFORE", "AFTER", "FOREVER", "THRU", "THROUGH",
 })
-# Common one-word COBOL sentences that are statements, not paragraph definitions.
-_COBOL_NON_PARAGRAPH = frozenset({"EXIT", "CONTINUE", "GOBACK"})
+# One-word COBOL sentences that look like a paragraph header but are statements,
+# plus data-division entry types and embedded-SQL/CICS keywords that can leak
+# through as bogus "paragraph names" on a partial parse.
+_COBOL_NON_PARAGRAPH = frozenset({
+    "EXIT", "CONTINUE", "GOBACK", "FD", "SD", "RD", "CD", "END", "EXEC", "END-EXEC",
+    "CICS", "SQL", "SQLIMS", "DLI", "LINK", "XCTL", "PROGRAM", "COMMAREA", "MAP", "MAPSET",
+})
+# Tokens that can follow FROM/JOIN/UPDATE in embedded SQL but aren't table names.
+_SQL_NON_TABLE = frozenset({"TABLE", "LATERAL", "ONLY", "FINAL", "OLD", "NEW", "SELECT", "VALUES", "DUAL"})
 
 
 def _blank_keep_newlines(text: str) -> str:
     return re.sub(r"[^\n]", " ", text)
 
 
-def _normalize_cobol_source(text: str) -> tuple[str, list[str]]:
-    """Best-effort port of the ProLeap COBOL preprocessor's line handling.
-
-    Detects fixed vs. free source format, drops comment/debug/directive lines,
-    joins continuation lines, captures ``COPY`` members and strips ``COPY`` /
-    ``REPLACE`` / compiler directives / ``EXEC SQL|CICS`` blocks — the ProLeap
-    COBOL85 grammar expects already-preprocessed input. Newlines are preserved
-    so ANTLR token line numbers still line up with the original file.
-
-    Returns ``(normalized_source, copybook_member_names)``.
-    """
+def _decolumn_cobol(text: str) -> str:
+    """Best-effort port of the ProLeap COBOL preprocessor's line handling: detect
+    fixed vs. free source format, drop comment/debug lines, and join ``-``
+    continuation lines (handling continued non-numeric literals). Newlines are
+    preserved so token/line numbers still line up with the original file."""
     raw = text.splitlines()
     fixed_votes = free_votes = 0
     for ln in raw:
@@ -2459,7 +2494,13 @@ def _normalize_cobol_source(text: str) -> tuple[str, list[str]]:
                 continue
             code = s[7:72] if len(s) > 7 else ""
             if ind == "-" and out:
-                out[-1] = out[-1].rstrip() + code.lstrip()
+                prev = out[-1].rstrip()
+                cont = code.lstrip()
+                # Continuation of a non-numeric literal: the resume quote on the
+                # continuation line is a delimiter, not part of the literal value.
+                if cont[:1] in ("'", '"') and prev.count(cont[0]) % 2 == 1:
+                    cont = cont[1:]
+                out[-1] = prev + cont
                 out.append("")
                 continue
             out.append(code)
@@ -2469,7 +2510,35 @@ def _normalize_cobol_source(text: str) -> tuple[str, list[str]]:
                 out.append("")
                 continue
             out.append(s)
-    src = "\n".join(out)
+    return "\n".join(out)
+
+
+def _strip_cobol_for_grammar(deco: str) -> tuple[str, list[str]]:
+    """Turn de-columned COBOL into something the bare ProLeap COBOL85 grammar can
+    parse (the grammar expects preprocessed input): blank IDENTIFICATION-DIVISION
+    comment entries (AUTHOR./INSTALLATION./...), ``COPY``/``REPLACE`` statements,
+    compiler directives, and ``EXEC SQL|CICS|DLI`` blocks. Returns the stripped
+    source plus the list of ``COPY`` member names that were removed."""
+    kept: list[str] = []
+    in_id_division = False
+    for ln in deco.split("\n"):
+        u = ln.lstrip().upper()
+        if re.match(r"^(?:IDENTIFICATION|ID)[ \t]+DIVISION\b", u):
+            in_id_division = True
+            kept.append(ln)
+            continue
+        if in_id_division:
+            if re.match(r"^(?:ENVIRONMENT|DATA|PROCEDURE)[ \t]+DIVISION\b", u):
+                in_id_division = False
+                kept.append(ln)
+                continue
+            if re.match(r"^PROGRAM-ID\b", u):
+                kept.append(ln)
+                continue
+            kept.append(_blank_keep_newlines(ln))
+            continue
+        kept.append(ln)
+    src = "\n".join(kept)
 
     copybooks: list[str] = []
 
@@ -2478,26 +2547,35 @@ def _normalize_cobol_source(text: str) -> tuple[str, list[str]]:
         return _blank_keep_newlines(m.group(0))
 
     src = re.sub(
-        r"(?is)\bCOPY\b[ \t]+([\w$#@-]+|'[^']+'|\"[^\"]+\")"
-        r"(?:[ \t]+(?:OF|IN)[ \t]+[\w$#@-]+)?(?:[ \t]+SUPPRESS\b)?(?:[ \t]+REPLACING\b.*?)?\.",
+        r"(?ims)^[ \t]*COPY\b[ \t]+([\w$#@-]+|'[^'\n]+'|\"[^\"\n]+\")"
+        r"(?:[ \t]+(?:OF|IN)[ \t]+[\w$#@-]+)?(?:[ \t]+SUPPRESS\b)?(?:[ \t\n]+REPLACING\b.*?)?\.",
         _copy_repl, src,
     )
-    src = re.sub(r"(?is)\bREPLACE\b.*?\.", lambda m: _blank_keep_newlines(m.group(0)), src)
-    src = re.sub(r"(?im)^[ \t]*(?:EJECT|SKIP[123]|TITLE\b[^\n]*|>>[^\n]*)\.?[ \t]*$",
+    src = re.sub(r"(?ims)^[ \t]*REPLACE\b.*?\.", lambda m: _blank_keep_newlines(m.group(0)), src)
+    src = re.sub(r"(?im)^[ \t]*(?:EJECT|SKIP[123]|TITLE\b[^\n]*|>>[^\n]*)[ \t]*\.?[ \t]*$",
                  lambda m: _blank_keep_newlines(m.group(0)), src)
-    src = re.sub(r"(?is)\bEXEC\b[ \t]+(?:SQL(?:IMS)?|CICS|DLI)\b.*?\bEND-EXEC\b\.?",
+    src = re.sub(r"(?is)\bEXEC\b[ \t]+(?:SQL(?:IMS)?|CICS|DL/?I|ADS)\b.*?\bEND[ \t-]?EXEC\b[ \t]*\.?",
                  lambda m: _blank_keep_newlines(m.group(0)), src)
     return src, copybooks
 
 
-def _cobol_antlr_extract(path: Path, normalized_src: str, copybooks: list[str]) -> dict | None:
-    """Parse normalized COBOL with the vendored ProLeap COBOL85 ANTLR4 grammar.
+def _quote_balanced_before(line_text: str, idx: int) -> bool:
+    """True if ``idx`` in ``line_text`` is outside any quoted literal (i.e. an even
+    number of quote characters precede it). Used to skip keyword-like substrings
+    inside COBOL string literals (e.g. ``DISPLAY 'PLEASE CALL SUPPORT'``)."""
+    prefix = line_text[:idx]
+    return prefix.count("'") % 2 == 0 and prefix.count('"') % 2 == 0
+
+
+def _cobol_antlr_extract(path: Path, grammar_src: str) -> dict | None:
+    """Parse grammar-ready COBOL with the vendored ProLeap COBOL85 ANTLR4 grammar.
 
     Returns an extraction dict, or ``None`` if the optional ``antlr4-python3-runtime``
-    is missing or the parse produced no structure (caller then uses the regex
-    fallback)."""
+    is missing, the file is too large, or the parse recovered no structure."""
+    if len(grammar_src) > 4_000_000:  # very large source — skip the (slower) full parse
+        return None
     try:
-        from antlr4 import InputStream, CommonTokenStream, ParseTreeWalker
+        from antlr4 import InputStream, CommonTokenStream, ParseTreeWalker, PredictionMode
         from antlr4.error.ErrorListener import ErrorListener
         from graphify._antlr.cobol85.Cobol85Lexer import Cobol85Lexer
         from graphify._antlr.cobol85.Cobol85Parser import Cobol85Parser
@@ -2519,12 +2597,16 @@ def _cobol_antlr_extract(path: Path, normalized_src: str, copybooks: list[str]) 
             pass
 
     try:
-        lexer = Cobol85Lexer(InputStream(normalized_src))
+        lexer = Cobol85Lexer(InputStream(grammar_src))
         lexer.removeErrorListeners()
         lexer.addErrorListener(_SilentErrors())
         parser = Cobol85Parser(CommonTokenStream(lexer))
         parser.removeErrorListeners()
         parser.addErrorListener(_SilentErrors())
+        # SLL is much faster than the default LL prediction; mispredictions on the
+        # (intentionally permissive) COBOL grammar are reported as errors and
+        # recovered, which is fine for structural extraction.
+        parser._interp.predictionMode = PredictionMode.SLL
         tree = parser.startRule()
     except Exception:
         return None
@@ -2547,6 +2629,7 @@ def _cobol_antlr_extract(path: Path, normalized_src: str, copybooks: list[str]) 
         def __init__(self):
             self.prog_stack: list[str] = []
             self.cur_para: str | None = None
+            self.found_paragraph = False
 
         @property
         def cur_prog(self) -> str | None:
@@ -2590,6 +2673,7 @@ def _cobol_antlr_extract(path: Path, normalized_src: str, copybooks: list[str]) 
             name = _clean(hdr.sectionName().getText())
             if not name:
                 return
+            self.found_paragraph = True
             nid = _make_id(self.cur_prog, name)
             _add(nid, name, _mf_loc(ctx))
             edges.append(_mf_edge(_make_id(self.cur_prog), nid, "defines", str_path, _mf_loc(ctx)))
@@ -2602,6 +2686,7 @@ def _cobol_antlr_extract(path: Path, normalized_src: str, copybooks: list[str]) 
             name = _clean(pn.getText())
             if not name:
                 return
+            self.found_paragraph = True
             self.cur_para = name
             nid = _make_id(self.cur_prog, name)
             _add(nid, name, _mf_loc(ctx))
@@ -2635,63 +2720,93 @@ def _cobol_antlr_extract(path: Path, normalized_src: str, copybooks: list[str]) 
                 tnid = _make_id(self.cur_prog, target)
                 edges.append(_mf_edge(self._scope(), tnid, "calls", str_path, _mf_loc(ctx)))
 
+        def enterGoToStatement(self, ctx):
+            if not self.cur_prog:
+                return
+            try:
+                names = ctx.procedureName()
+            except AttributeError:
+                names = []
+            for pn in names or []:
+                target = None
+                if pn.paragraphName() is not None:
+                    target = _clean(pn.paragraphName().getText())
+                elif pn.sectionName() is not None:
+                    target = _clean(pn.sectionName().getText())
+                if not target:
+                    continue
+                edges.append(_mf_edge(self._scope(), _make_id(self.cur_prog, target),
+                                      "calls", str_path, _mf_loc(ctx), conf="INFERRED", score=0.7))
+
+    walker = _Walk()
     try:
-        ParseTreeWalker().walk(_Walk(), tree)
+        ParseTreeWalker().walk(walker, tree)
     except Exception:
         return None
 
-    if len(nodes) <= 1:
-        return None  # nothing recognized — let the regex fallback try
-
-    for cb in dict.fromkeys(copybooks):
-        cb = cb.strip()
-        if not cb:
-            continue
-        cbid = _make_id(cb)
-        _add(cbid, cb)
-        edges.append(_mf_edge(file_nid, cbid, "includes", str_path))
-
+    if not walker.found_paragraph and len(nodes) <= 2:
+        return None  # parse recovered nothing useful — let the regex extractor stand
     return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
 
 
-def _cobol_regex_extract(path: Path, original_src: str, normalized: str, copybooks: list[str]) -> dict:
-    """Dependency-free COBOL extractor used when the ANTLR4 runtime is unavailable
-    or the grammar parse recovered nothing useful."""
+def _cobol_para_index(nodes: list[dict], file_nid: str, prog_nid: str) -> list[tuple[int, str]]:
+    """Sorted (line, node_id) list of paragraph/section definitions, for resolving
+    which paragraph a statement at a given line belongs to."""
+    idx = []
+    for n in nodes:
+        if n["id"] in (file_nid, prog_nid):
+            continue
+        loc = n.get("source_location")
+        if isinstance(loc, str) and loc.startswith("L") and loc[1:].isdigit():
+            idx.append((int(loc[1:]), n["id"]))
+    return sorted(idx)
+
+
+def _cobol_regex_extract(path: Path, deco: str, copybooks: list[str]) -> dict:
+    """Structural COBOL extractor that works on de-columned source with plain
+    regexes — programs, sections, paragraphs, CALL/PERFORM/GO-TO call edges scoped
+    to the enclosing paragraph, COPY dependencies, and embedded SQL/CICS
+    references. Robust against dialect extensions the bare grammar can't parse and
+    used as the base layer for :func:`extract_cobol`."""
     str_path = str(path)
     file_nid = _make_id(str_path)
     nodes: list[dict] = [_mf_node(file_nid, path.name, str_path)]
     edges: list[dict] = []
     seen: set[str] = {file_nid}
 
-    def _add(nid: str, label: str, loc: str | None = None) -> None:
+    def _add(nid: str, label: str, loc: str | None = None, ftype: str = "code") -> None:
         if nid not in seen:
-            nodes.append(_mf_node(nid, label, str_path, loc))
+            nodes.append(_mf_node(nid, label, str_path, loc, ftype))
             seen.add(nid)
 
-    def _line_of(idx: int) -> str:
-        return f"L{normalized.count(chr(10), 0, idx) + 1}"
+    lines = deco.split("\n")
+    line_starts = [0]
+    for ln in lines:
+        line_starts.append(line_starts[-1] + len(ln) + 1)
+
+    def _line_no(idx: int) -> int:
+        return bisect.bisect_right(line_starts, idx)
 
     progs: list[str] = []
-    for m in re.finditer(r"(?im)^[ \t]*PROGRAM-ID[ \t]*\.[ \t]*([\w$#@-]+|'[^']+'|\"[^\"]+\")", normalized):
+    for m in re.finditer(r"(?im)^[ \t]*PROGRAM-ID[ \t]*\.[ \t]*([\w$#@-]+|'[^']+'|\"[^\"]+\")", deco):
         name = m.group(1).strip("'\"")
         if not name:
             continue
         progs.append(name)
         nid = _make_id(name)
-        _add(nid, name, _line_of(m.start()))
-        edges.append(_mf_edge(file_nid, nid, "defines", str_path, _line_of(m.start())))
+        _add(nid, name, f"L{_line_no(m.start())}")
+        edges.append(_mf_edge(file_nid, nid, "defines", str_path, f"L{_line_no(m.start())}"))
     prog = progs[0] if progs else _file_stem(path).split(".")[-1].upper()
-    if not progs:
-        _add(_make_id(prog), prog)
-        edges.append(_mf_edge(file_nid, _make_id(prog), "defines", str_path))
     prog_nid = _make_id(prog)
+    if not progs:
+        _add(prog_nid, prog)
+        edges.append(_mf_edge(file_nid, prog_nid, "defines", str_path))
 
-    lines = normalized.split("\n")
     proc_idx = next((i for i, ln in enumerate(lines) if re.match(r"(?i)^[ \t]*PROCEDURE[ \t]+DIVISION\b", ln)), None)
     if proc_idx is not None:
         for i in range(proc_idx + 1, len(lines)):
-            # Paragraph / section names live in Area A (column 8+ in the original,
-            # i.e. the start of the de-columned line); statements are indented.
+            # Paragraph / section names live in Area A — the very start of the
+            # de-columned line; statements in Area B are indented.
             m = re.match(r"^([A-Za-z0-9][\w$#@-]*)[ \t]*(SECTION)?[ \t]*\.[ \t]*$", lines[i])
             if not m or m.group(1).upper() in _COBOL_NON_PARAGRAPH:
                 continue
@@ -2700,23 +2815,50 @@ def _cobol_regex_extract(path: Path, original_src: str, normalized: str, copyboo
             _add(nid, name, f"L{i + 1}")
             edges.append(_mf_edge(prog_nid, nid, "defines", str_path, f"L{i + 1}"))
 
-    for m in re.finditer(r"(?i)\bCALL[ \t]+(?:'([^']+)'|\"([^\"]+)\")", normalized):
+    para_index = _cobol_para_index(nodes, file_nid, prog_nid)
+
+    def _scope_at(line_no: int) -> str:
+        if not para_index:
+            return prog_nid
+        pos = bisect.bisect_right(para_index, (line_no, "￿")) - 1
+        return para_index[pos][1] if pos >= 0 else prog_nid
+
+    def _emit_call(line_no: int, target_nid: str, *, conf="EXTRACTED", score=1.0):
+        edges.append(_mf_edge(_scope_at(line_no), target_nid, "calls", str_path, f"L{line_no}",
+                              conf=conf, score=score))
+
+    # CALL 'literal'  (static program call). Skip matches inside string literals.
+    for m in re.finditer(r"(?i)\bCALL\b[ \t]+(?:'([^'\n]+)'|\"([^\"\n]+)\")", deco):
+        line_no = _line_no(m.start())
+        if not _quote_balanced_before(lines[line_no - 1], m.start() - line_starts[line_no - 1]):
+            continue
         target = (m.group(1) or m.group(2)).strip()
         if not target:
             continue
         tnid = _make_id(target)
         _add(tnid, target)
-        edges.append(_mf_edge(prog_nid, tnid, "calls", str_path, _line_of(m.start())))
+        _emit_call(line_no, tnid)
 
-    for m in re.finditer(r"(?i)\bPERFORM[ \t]+([A-Za-z0-9][\w$#@-]*)(?:[ \t]+(?:THRU|THROUGH)[ \t]+([A-Za-z0-9][\w$#@-]*))?", normalized):
+    # PERFORM para [THRU/THROUGH para]   (only when followed by an identifier, not
+    # an inline PERFORM body like "PERFORM 5 TIMES" or "PERFORM UNTIL ...").
+    for m in re.finditer(r"(?i)\bPERFORM\b[ \t]+([A-Za-z0-9][\w$#@-]*)(?:[ \t]+(?:THRU|THROUGH)[ \t]+([A-Za-z0-9][\w$#@-]*))?", deco):
+        line_no = _line_no(m.start())
         for g in (m.group(1), m.group(2)):
             if not g or g.upper() in _COBOL_NON_PROCEDURE or g.upper() in _COBOL_NON_PARAGRAPH:
                 continue
-            edges.append(_mf_edge(prog_nid, _make_id(prog, g), "calls", str_path, _line_of(m.start()),
-                                  conf="INFERRED", score=0.7))
+            _emit_call(line_no, _make_id(prog, g))
 
+    # GO TO para  (unconditional branch; treated as a weak call edge).
+    for m in re.finditer(r"(?i)\bGO(?:[ \t]+TO|TO)\b[ \t]+([A-Za-z0-9][\w$#@-]*)", deco):
+        line_no = _line_no(m.start())
+        g = m.group(1)
+        if g.upper() in _COBOL_NON_PARAGRAPH or g.upper() == "DEPENDING":
+            continue
+        _emit_call(line_no, _make_id(prog, g), conf="INFERRED", score=0.7)
+
+    # COPY members (also re-scanned here in case they survived the grammar strip).
     members = list(dict.fromkeys(copybooks))
-    for m in re.finditer(r"(?im)^[ \t]*COPY[ \t]+([\w$#@-]+|'[^']+'|\"[^\"]+\")", original_src):
+    for m in re.finditer(r"(?im)^[ \t]*COPY\b[ \t]+([\w$#@-]+|'[^'\n]+'|\"[^\"\n]+\")", deco):
         members.append(m.group(1).strip("'\""))
     for cb in dict.fromkeys(members):
         cb = cb.strip()
@@ -2726,29 +2868,70 @@ def _cobol_regex_extract(path: Path, original_src: str, normalized: str, copyboo
         _add(cbid, cb)
         edges.append(_mf_edge(file_nid, cbid, "includes", str_path))
 
+    # Embedded SQL / CICS — the grammar can't see inside these (they're stripped
+    # for the parse), so mine them with regexes for table / program / map deps.
+    for m in re.finditer(r"(?is)\bEXEC\b[ \t]+(SQL(?:IMS)?|CICS|DL/?I|ADS)\b(.*?)\bEND[ \t-]?EXEC\b", deco):
+        kind = m.group(1).upper()
+        body = m.group(2)
+        line_no = _line_no(m.start())
+        scope = _scope_at(line_no)
+        if kind.startswith("SQL"):
+            inc = re.match(r"(?is)^[ \t\n]*INCLUDE\b[ \t]+([\w$#@-]+)", body)
+            if inc:
+                mem = inc.group(1)
+                _add(_make_id(mem), mem)
+                edges.append(_mf_edge(file_nid, _make_id(mem), "includes", str_path, f"L{line_no}"))
+                continue
+            for tm in re.finditer(r"(?is)\b(?:FROM|JOIN|INSERT[ \t]+INTO|UPDATE|DELETE[ \t]+FROM)\b[ \t]+([A-Za-z_][\w$#@]*(?:\.[A-Za-z_][\w$#@]*)*)", body):
+                tbl = tm.group(1)
+                if tbl.split(".")[-1].upper() in _SQL_NON_TABLE:
+                    continue
+                tnid = _make_id("tbl", tbl)
+                _add(tnid, tbl, ftype="concept")
+                edges.append(_mf_edge(scope, tnid, "uses", str_path, f"L{line_no}", conf="INFERRED", score=0.7))
+        elif kind == "CICS":
+            lk = re.search(r"(?is)\b(?:LINK|XCTL)\b.*?\bPROGRAM\b[ \t]*\([ \t]*'([^'\n]+)'", body)
+            if lk:
+                pg = lk.group(1).strip()
+                _add(_make_id(pg), pg)
+                edges.append(_mf_edge(scope, _make_id(pg), "calls", str_path, f"L{line_no}"))
+            mp = re.search(r"(?is)\b(?:SEND|RECEIVE)\b.*?\bMAP\b[ \t]*\([ \t]*'([^'\n]+)'", body)
+            if mp:
+                name = mp.group(1).strip()
+                _add(_make_id("map", name), name, ftype="concept")
+                edges.append(_mf_edge(scope, _make_id("map", name), "uses", str_path, f"L{line_no}", conf="INFERRED", score=0.7))
+            fl = re.search(r"(?is)\b(?:FILE|DATASET)\b[ \t]*\([ \t]*'([^'\n]+)'", body)
+            if fl:
+                name = fl.group(1).strip()
+                _add(_make_id("dsn", name), name, ftype="concept")
+                edges.append(_mf_edge(scope, _make_id("dsn", name), "uses", str_path, f"L{line_no}", conf="INFERRED", score=0.7))
+
     return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
 
 
 def extract_cobol(path: Path) -> dict:
-    """Extract programs, sections, paragraphs, CALL/PERFORM relationships and COPY
-    dependencies from a COBOL source file.
+    """Extract programs, sections, paragraphs, CALL/PERFORM/GO-TO call edges, COPY
+    dependencies and embedded SQL/CICS references from a COBOL source file.
 
-    Uses the ProLeap COBOL 85 ANTLR4 grammar (vendored under ``graphify/_antlr``)
-    when the optional ``antlr4-python3-runtime`` is installed; otherwise falls back
-    to a regex extractor. Handles both fixed- and free-format source."""
+    A regex-based structural extractor (robust against IBM/GnuCOBOL dialect
+    extensions and fixed/free format) forms the base layer; when the optional
+    ``antlr4-python3-runtime`` is installed, the file is also parsed with the
+    vendored ProLeap COBOL 85 ANTLR4 grammar and its precise paragraph-scoped call
+    edges are merged in."""
     try:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {"error": f"cannot read {path}"}
-    normalized, copybooks = _normalize_cobol_source(src)
-    result = _cobol_antlr_extract(path, normalized, copybooks)
-    if result is not None:
-        return result
-    return _cobol_regex_extract(path, src, normalized, copybooks)
+    deco = _decolumn_cobol(src)
+    grammar_src, copybooks = _strip_cobol_for_grammar(deco)
+    base = _cobol_regex_extract(path, deco, copybooks)
+    antlr = _cobol_antlr_extract(path, grammar_src)
+    return _mf_merge(base, antlr)
 
 
 def extract_copybook(path: Path) -> dict:
-    """Extract top-level record names (01-level data items) from a COBOL copybook.
+    """Extract top-level record names (01/77-level data items) and nested COPY
+    dependencies from a COBOL copybook.
 
     Copybooks are data definitions, not full programs, so they get a lightweight
     record-level extraction rather than the COBOL85 program grammar. The copybook
@@ -2757,32 +2940,38 @@ def extract_copybook(path: Path) -> dict:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {"error": f"cannot read {path}"}
-    normalized, _ = _normalize_cobol_source(src)
+    deco = _decolumn_cobol(src)
     str_path = str(path)
     member = _file_stem(path).split(".")[-1]
     file_nid = _make_id(member)
     nodes: list[dict] = [_mf_node(file_nid, path.name, str_path)]
     edges: list[dict] = []
     seen: set[str] = {file_nid}
-    for i, ln in enumerate(normalized.split("\n")):
-        m = re.match(r"^[ \t]*0?1[ \t]+([A-Za-z][\w$#@-]*)\b", ln)
-        if not m:
+    for i, ln in enumerate(deco.split("\n")):
+        m = re.match(r"^[ \t]*(0?1|77)[ \t]+([A-Za-z][\w$#@-]*)\b", ln)
+        if m:
+            name = m.group(2)
+            if name.upper() != "FILLER":
+                nid = _make_id(member, name)
+                if nid not in seen:
+                    seen.add(nid)
+                    nodes.append(_mf_node(nid, name, str_path, f"L{i + 1}"))
+                    edges.append(_mf_edge(file_nid, nid, "defines", str_path, f"L{i + 1}"))
             continue
-        name = m.group(1)
-        if name.upper() in ("FILLER",):
-            continue
-        nid = _make_id(member, name)
-        if nid in seen:
-            continue
-        seen.add(nid)
-        nodes.append(_mf_node(nid, name, str_path, f"L{i + 1}"))
-        edges.append(_mf_edge(file_nid, nid, "defines", str_path, f"L{i + 1}"))
-    return {"nodes": nodes, "edges": edges}
+        cm = re.match(r"(?i)^[ \t]*COPY\b[ \t]+([\w$#@-]+|'[^'\n]+'|\"[^\"\n]+\")", ln)
+        if cm:
+            cb = cm.group(1).strip("'\"")
+            cbid = _make_id(cb)
+            if cbid not in seen:
+                seen.add(cbid)
+                nodes.append(_mf_node(cbid, cb, str_path))
+            edges.append(_mf_edge(file_nid, cbid, "includes", str_path, f"L{i + 1}"))
+    return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
 
 
 def extract_jcl(path: Path) -> dict:
-    """Extract jobs, steps (EXEC PGM=/PROC=), DD datasets, and INCLUDE members from
-    a JCL (Job Control Language) member."""
+    """Extract jobs, in-stream procedures, steps (EXEC PGM=/PROC=), DD dataset
+    reads/writes, and INCLUDE members from a JCL (Job Control Language) member."""
     try:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -2798,29 +2987,55 @@ def extract_jcl(path: Path) -> dict:
             nodes.append(_mf_node(nid, label, str_path, loc, ftype))
             seen.add(nid)
 
+    stem = _file_stem(path).split(".")[-1]
     cur_job: str | None = None
+    cur_proc: str | None = None  # in-stream PROC currently being defined
     cur_step_nid: str | None = None
+    prev_was_dd = False
     for i, raw in enumerate(src.splitlines()):
         ln = raw.rstrip()
         if ln.startswith("//*") or not ln.startswith("//"):
+            prev_was_dd = False
             continue
         body = ln[2:]
+        loc = f"L{i + 1}"
         m = re.match(r"^([A-Z0-9#@$]{1,8})?\s+(\S+)\s*(.*)$", body)
-        if not m:
+        # A nameless line whose first token looks like an operand fragment
+        # (KEYWORD=value) is a continuation of the previous statement.
+        is_continuation = (m is None) or (m.group(1) is None and m.group(2) != "DD" and "=" in m.group(2))
+        if is_continuation:
+            if prev_was_dd:
+                cont = re.search(r"\bDSN(?:AME)?=([A-Z0-9#@$.()+\-]+)", body, re.I)
+                if cont:
+                    name_only = cont.group(1).split("(")[0]
+                    dn = _make_id("dsn", name_only)
+                    _add(dn, name_only, ftype="concept")
+                    src_nid = cur_step_nid or _make_id(cur_proc or cur_job or stem)
+                    rel = "writes" if re.search(r"DISP=\(?\s*(?:NEW|MOD)\b", body, re.I) else "reads"
+                    edges.append(_mf_edge(src_nid, dn, rel, str_path, loc))
             continue
         name, op, operands = m.group(1), m.group(2).upper(), m.group(3)
-        loc = f"L{i + 1}"
+        prev_was_dd = (op == "DD")
+        owner_nid = _make_id(cur_proc) if cur_proc else (_make_id(cur_job) if cur_job else file_nid)
+        scope_label = cur_proc or cur_job or stem
         if op == "JOB":
-            cur_job = name or _file_stem(path).split(".")[-1]
+            cur_job = name or stem
+            cur_proc = None
             jid = _make_id(cur_job)
             _add(jid, cur_job, loc)
             edges.append(_mf_edge(file_nid, jid, "defines", str_path, loc))
+        elif op == "PROC" and name:
+            cur_proc = name
+            pid = _make_id(name)
+            _add(pid, name, loc)
+            edges.append(_mf_edge(file_nid, pid, "defines", str_path, loc))
+        elif op == "PEND":
+            cur_proc = None
         elif op == "EXEC":
             step = name or f"STEP{i + 1}"
-            owner = _make_id(cur_job) if cur_job else file_nid
-            cur_step_nid = _make_id(cur_job or _file_stem(path).split(".")[-1], step)
+            cur_step_nid = _make_id(scope_label, step)
             _add(cur_step_nid, step, loc)
-            edges.append(_mf_edge(owner, cur_step_nid, "defines", str_path, loc))
+            edges.append(_mf_edge(owner_nid, cur_step_nid, "defines", str_path, loc))
             pgm = re.search(r"\bPGM=([A-Z0-9#@$.]+)", operands, re.I)
             proc = re.search(r"\bPROC=([A-Z0-9#@$.]+)", operands, re.I)
             if pgm:
@@ -2843,9 +3058,9 @@ def extract_jcl(path: Path) -> dict:
                 name_only = dsn.group(1).split("(")[0]
                 dn = _make_id("dsn", name_only)
                 _add(dn, name_only, ftype="concept")
-                source_nid = cur_step_nid or (_make_id(cur_job) if cur_job else file_nid)
+                src_nid = cur_step_nid or owner_nid
                 rel = "writes" if re.search(r"DISP=\(?\s*(?:NEW|MOD)\b", operands, re.I) else "reads"
-                edges.append(_mf_edge(source_nid, dn, rel, str_path, loc))
+                edges.append(_mf_edge(src_nid, dn, rel, str_path, loc))
         elif op == "INCLUDE":
             mem = re.search(r"\bMEMBER=([A-Z0-9#@$]+)", operands, re.I)
             if mem:
@@ -2856,7 +3071,8 @@ def extract_jcl(path: Path) -> dict:
 
 
 def extract_pli(path: Path) -> dict:
-    """Extract procedures/entries, %INCLUDE members, and CALL relationships from a PL/I source file."""
+    """Extract procedures/entries, %INCLUDE members, FETCH targets, and CALL
+    relationships from a PL/I source file."""
     try:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -2894,7 +3110,14 @@ def extract_pli(path: Path) -> dict:
         _add(tn, member)
         edges.append(_mf_edge(file_nid, tn, "includes", str_path, _line_of(m.start())))
 
+    for m in re.finditer(r"(?i)\bFETCH[ \t]+([A-Z_@#$][\w@#$]*)", clean):
+        tn = _make_id(m.group(1))
+        _add(tn, m.group(1))
+        edges.append(_mf_edge(caller, tn, "calls", str_path, _line_of(m.start()), conf="INFERRED", score=0.7))
+
     for m in re.finditer(r"(?i)\bCALL[ \t]+([A-Z_@#$][\w@#$]*)", clean):
+        if m.group(1).upper() == "PLIRETC":
+            continue
         edges.append(_mf_edge(caller, _make_id(m.group(1)), "calls", str_path, _line_of(m.start()),
                               conf="INFERRED", score=0.7))
 
@@ -2902,7 +3125,8 @@ def extract_pli(path: Path) -> dict:
 
 
 def extract_rexx(path: Path) -> dict:
-    """Extract internal routines (labels) and CALL relationships from a REXX exec."""
+    """Extract internal routines (labels) plus CALL and internal-function-call
+    relationships from a REXX exec."""
     try:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -2913,6 +3137,7 @@ def extract_rexx(path: Path) -> dict:
     nodes: list[dict] = [_mf_node(file_nid, path.name, str_path)]
     edges: list[dict] = []
     seen: set[str] = {file_nid}
+    routines: dict[str, str] = {}  # UPPER name -> node id
 
     def _add(nid: str, label: str, loc: str | None = None) -> None:
         if nid not in seen:
@@ -2927,6 +3152,7 @@ def extract_rexx(path: Path) -> dict:
         name = m.group(1)
         nid = _make_id(stem, name)
         _add(nid, name, f"L{i + 1}")
+        routines[name.upper()] = nid
         edges.append(_mf_edge(file_nid, nid, "defines", str_path, f"L{i + 1}"))
 
     for m in re.finditer(r"(?i)\bCALL[ \t]+([A-Za-z_@#$!?][\w@#$!?.]*)", clean):
@@ -2936,6 +3162,14 @@ def extract_rexx(path: Path) -> dict:
         line = f"L{clean.count(chr(10), 0, m.start()) + 1}"
         edges.append(_mf_edge(file_nid, _make_id(stem, callee), "calls", str_path, line,
                               conf="INFERRED", score=0.7))
+
+    # Internal function-style invocations: NAME(...) where NAME is a label.
+    for m in re.finditer(r"(?i)\b([A-Za-z_@#$!?][\w@#$!?.]*)[ \t]*\(", clean):
+        nid = routines.get(m.group(1).upper())
+        if nid is None:
+            continue
+        line = f"L{clean.count(chr(10), 0, m.start()) + 1}"
+        edges.append(_mf_edge(file_nid, nid, "calls", str_path, line, conf="INFERRED", score=0.7))
 
     return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
 
