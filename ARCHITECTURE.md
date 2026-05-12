@@ -64,7 +64,9 @@ Every extractor returns:
 5. Add a fixture file to `tests/fixtures/` and tests to `tests/test_languages.py`.
 
 Not every language has a tree-sitter grammar. Some extractors are pure-regex
-(Dart, Blade, Lazarus forms, JCL, PL/I, REXX). COBOL uses a two-layer design:
+(Dart, Blade, Lazarus forms, and the mainframe formats: JCL, PL/I, REXX, HLASM
+assembler, IMS DBD/PSB, CICS BMS, and the DB2 DDL fallback). COBOL uses a
+two-layer design:
 `_cobol_regex_extract` is a robust structural extractor (handles fixed/free
 format, continuation lines, `COPY`/`REPLACE`/directives, embedded SQL/CICS, and
 IBM/GnuCOBOL dialect extensions) and is always the trusted base; when the

@@ -11,6 +11,10 @@ from graphify.extract import (
     extract_jcl,
     extract_pli,
     extract_rexx,
+    extract_hlasm,
+    extract_ims,
+    extract_bms,
+    extract_ddl,
     _cobol_regex_extract,
     _decolumn_cobol,
     _strip_cobol_for_grammar,
@@ -347,7 +351,15 @@ def test_rexx_finds_routines_and_calls():
     (".pl1", "extract_pli"),
     (".rexx", "extract_rexx"),
     (".rex", "extract_rexx"),
-    (".ddl", "extract_sql"),
+    (".ddl", "extract_ddl"),
+    (".asm", "extract_hlasm"),
+    (".mlc", "extract_hlasm"),
+    (".hlasm", "extract_hlasm"),
+    (".dbd", "extract_ims"),
+    (".psb", "extract_ims"),
+    (".bms", "extract_bms"),
+    (".mapset", "extract_bms"),
+    (".proc", "extract_jcl"),
 ])
 def test_dispatch_registered(suffix, expected):
     from graphify.extract import _DISPATCH
@@ -357,5 +369,128 @@ def test_dispatch_registered(suffix, expected):
 
 def test_extensions_in_detect():
     from graphify.detect import CODE_EXTENSIONS
-    for ext in (".cob", ".cbl", ".cobol", ".cpy", ".copy", ".jcl", ".pli", ".pl1", ".rexx", ".rex", ".ddl"):
+    for ext in (".cob", ".cbl", ".cobol", ".cpy", ".copy", ".jcl", ".proc", ".pli", ".pl1",
+                ".rexx", ".rex", ".ddl", ".asm", ".mlc", ".hlasm", ".dbd", ".psb", ".bms", ".mapset"):
         assert ext in CODE_EXTENSIONS
+
+
+# ── HLASM (mainframe assembler) ───────────────────────────────────────────────
+
+def test_hlasm_no_error():
+    r = extract_hlasm(FIXTURES / "sample.asm")
+    assert "error" not in r
+    _assert_schema_ok(r)
+
+
+def test_hlasm_control_sections_and_macros():
+    r = extract_hlasm(FIXTURES / "sample.asm")
+    labels = _labels(r)
+    assert "MYPROG" in labels          # CSECT
+    assert "WORKAREA" in labels        # DSECT
+    assert "MYMAC" in labels           # MACRO definition
+    # No bogus opcode/operand "definitions" leaked in.
+    for junk in ("DC", "DS", "BR", "CL8", "END", "MACRO", "A"):
+        assert junk not in labels
+
+
+def test_hlasm_call_and_extern_edges():
+    r = extract_hlasm(FIXTURES / "sample.asm")
+    calls = {t for _, t in _edges(r, "calls")}
+    assert "SUBRTN1" in calls          # CALL macro (positional)
+    assert "SUBRTN2" in calls          # LINK EP=...
+    assert "EXTSUB3" in calls          # =V(...) address constant
+    assert any(t == "MYMACROS" for _, t in _edges(r, "includes"))   # COPY include
+
+
+# ── IMS DBD / PSB ─────────────────────────────────────────────────────────────
+
+def test_ims_dbd_segment_hierarchy():
+    r = extract_ims(FIXTURES / "sample.dbd")
+    assert "error" not in r
+    _assert_schema_ok(r)
+    labels = _labels(r)
+    assert "CUSTDB" in labels
+    for seg in ("CUSTOMER", "ORDER", "ORDLINE"):
+        assert seg in labels
+    contains = _edges(r, "contains")
+    assert ("CUSTDB", "CUSTOMER") in contains
+    assert ("CUSTOMER", "ORDER") in contains
+    assert ("ORDER", "ORDLINE") in contains
+
+
+def test_ims_psb_uses_databases():
+    r = extract_ims(FIXTURES / "sample.psb")
+    assert "error" not in r
+    _assert_schema_ok(r)
+    uses = {t for _, t in _edges(r, "uses")}
+    assert "CUSTDB" in uses
+    assert "ITEMDB" in uses
+    assert "CUSTPSB" in _labels(r)     # PSBGEN PSBNAME=
+
+
+def test_ims_dbd_psb_segment_ids_match():
+    # A PSB's SENSEG and the owning DBD's SEGM produce the same node id,
+    # so a PSB and its DBDs link up when both are in the corpus.
+    from graphify.extract import extract
+    from graphify.build import build_from_json
+    ex = extract([FIXTURES / "sample.dbd", FIXTURES / "sample.psb"], cache_root=FIXTURES, parallel=False)
+    G = build_from_json(ex, directed=True)
+    lab = {n: d.get("label") for n, d in G.nodes(data=True)}
+    # CUSTOMER segment appears once, referenced by both the DBD (contains) and the PSB (uses).
+    cust_ids = [n for n, l in lab.items() if l == "CUSTOMER"]
+    assert len(cust_ids) == 1
+    deg = G.in_degree(cust_ids[0]) + G.out_degree(cust_ids[0])
+    assert deg >= 2
+
+
+# ── CICS BMS ──────────────────────────────────────────────────────────────────
+
+def test_bms_mapset_and_maps():
+    r = extract_bms(FIXTURES / "sample.bms")
+    assert "error" not in r
+    _assert_schema_ok(r)
+    labels = _labels(r)
+    assert "CONFSET" in labels
+    assert "CONFMAP" in labels
+    assert "ERRMAP" in labels
+    assert ("CONFSET", "CONFMAP") in _edges(r, "defines")
+
+
+def test_bms_map_id_matches_cobol_send_map():
+    from graphify.extract import _make_id
+    r = extract_bms(FIXTURES / "sample.bms")
+    confmap = next(n for n in r["nodes"] if n["label"] == "CONFMAP")
+    # COBOL `EXEC CICS SEND MAP('CONFMAP')` emits a node with this same id.
+    assert confmap["id"] == _make_id("map", "CONFMAP")
+
+
+# ── DB2 / SQL DDL ─────────────────────────────────────────────────────────────
+
+def test_ddl_extracts_tables():
+    r = extract_ddl(FIXTURES / "sample.ddl")
+    assert "error" not in r
+    labels = " ".join(_labels(r))
+    assert "CUSTOMER" in labels
+    assert "ORDERS" in labels
+
+
+def test_ddl_regex_fallback(tmp_path):
+    # Exercise the dependency-free fallback directly (independent of tree-sitter-sql).
+    from graphify.extract import extract_sql
+    p = tmp_path / "db2.ddl"
+    p.write_text(
+        "CREATE TABLESPACE TS1 IN MYDB;\n"
+        "CREATE TABLE APP.CUSTOMER (CUST_ID INT NOT NULL PRIMARY KEY);\n"
+        "CREATE TABLE APP.ORDERS (ORDER_ID INT, CUST_ID INT,\n"
+        "  FOREIGN KEY (CUST_ID) REFERENCES APP.CUSTOMER (CUST_ID));\n"
+        "CREATE UNIQUE INDEX APP.CUSTIX ON APP.CUSTOMER (CUST_ID);\n"
+    )
+    sql_r = extract_sql(p)
+    if "error" not in sql_r:
+        pytest.skip("tree-sitter-sql is installed; the regex fallback isn't exercised here")
+    r = extract_ddl(p)
+    _assert_schema_ok(r)
+    labels = " ".join(_labels(r))
+    assert "APP.CUSTOMER" in labels and "APP.ORDERS" in labels and "TS1" in labels
+    refs = _edges(r, "references")
+    assert any(s == "APP.ORDERS" and t == "APP.CUSTOMER" for s, t in refs)

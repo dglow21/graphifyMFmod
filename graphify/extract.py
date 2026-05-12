@@ -2471,18 +2471,26 @@ def _decolumn_cobol(text: str) -> str:
     continuation lines (handling continued non-numeric literals). Newlines are
     preserved so token/line numbers still line up with the original file."""
     raw = text.splitlines()
-    fixed_votes = free_votes = 0
+    fixed_votes = free_votes = seq_votes = nonblank = 0
     for ln in raw:
         s = ln.rstrip()
         if not s.strip():
             continue
+        nonblank += 1
         area_seq = s[:6]
         ind = s[6] if len(s) > 6 else " "
+        if area_seq.strip().isdigit():
+            seq_votes += 1
         if (area_seq.strip() == "" or area_seq.strip().isdigit()) and (len(s) <= 6 or ind in " *$/-Dd"):
             fixed_votes += 1
         elif s[:1] not in (" ", "\t", "*"):
             free_votes += 1
     fixed = fixed_votes >= 3 and fixed_votes >= free_votes
+    # Only cap code at column 72 when the file actually carries sequence numbers in
+    # columns 1-6 — that signals "true" reference format (so cols 73-80 are the
+    # identification area, not code). Otherwise keep everything after column 7:
+    # plenty of real COBOL is just indented to column 8 but lets code run past 72.
+    code_end = 72 if (nonblank and seq_votes >= max(3, nonblank // 2)) else None
 
     out: list[str] = []
     for ln in raw:
@@ -2492,7 +2500,7 @@ def _decolumn_cobol(text: str) -> str:
             if ind in _COBOL_NONCODE_INDICATORS:
                 out.append("")
                 continue
-            code = s[7:72] if len(s) > 7 else ""
+            code = (s[7:code_end] if code_end else s[7:]) if len(s) > 7 else ""
             if ind == "-" and out:
                 prev = out[-1].rstrip()
                 cont = code.lstrip()
@@ -2749,12 +2757,12 @@ def _cobol_antlr_extract(path: Path, grammar_src: str) -> dict | None:
     return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
 
 
-def _cobol_para_index(nodes: list[dict], file_nid: str, prog_nid: str) -> list[tuple[int, str]]:
+def _cobol_para_index(nodes: list[dict], exclude_ids: set[str]) -> list[tuple[int, str]]:
     """Sorted (line, node_id) list of paragraph/section definitions, for resolving
     which paragraph a statement at a given line belongs to."""
     idx = []
     for n in nodes:
-        if n["id"] in (file_nid, prog_nid):
+        if n["id"] in exclude_ids:
             continue
         loc = n.get("source_location")
         if isinstance(loc, str) and loc.startswith("L") and loc[1:].isdigit():
@@ -2787,20 +2795,32 @@ def _cobol_regex_extract(path: Path, deco: str, copybooks: list[str]) -> dict:
     def _line_no(idx: int) -> int:
         return bisect.bisect_right(line_starts, idx)
 
-    progs: list[str] = []
+    progs: list[tuple[int, str]] = []  # (line, program-name)
     for m in re.finditer(r"(?im)^[ \t]*PROGRAM-ID[ \t]*\.[ \t]*([\w$#@-]+|'[^']+'|\"[^\"]+\")", deco):
         name = m.group(1).strip("'\"")
         if not name:
             continue
-        progs.append(name)
+        ln_no = _line_no(m.start())
+        progs.append((ln_no, name))
         nid = _make_id(name)
-        _add(nid, name, f"L{_line_no(m.start())}")
-        edges.append(_mf_edge(file_nid, nid, "defines", str_path, f"L{_line_no(m.start())}"))
-    prog = progs[0] if progs else _file_stem(path).split(".")[-1].upper()
-    prog_nid = _make_id(prog)
+        _add(nid, name, f"L{ln_no}")
+        edges.append(_mf_edge(file_nid, nid, "defines", str_path, f"L{ln_no}"))
     if not progs:
-        _add(prog_nid, prog)
-        edges.append(_mf_edge(file_nid, prog_nid, "defines", str_path))
+        fallback = _file_stem(path).split(".")[-1].upper()
+        progs = [(1, fallback)]
+        _add(_make_id(fallback), fallback)
+        edges.append(_mf_edge(file_nid, _make_id(fallback), "defines", str_path))
+    progs.sort()
+    prog = progs[0][1]
+    prog_nid = _make_id(prog)
+    prog_lines = [p[0] for p in progs]
+    prog_nids_all = {_make_id(p[1]) for p in progs}
+
+    def _prog_at(line_no: int) -> tuple[str, str]:
+        # The program whose PROGRAM-ID precedes this line (for nested/contained programs).
+        pos = bisect.bisect_right(prog_lines, line_no) - 1
+        name = progs[pos][1] if pos >= 0 else prog
+        return _make_id(name), name
 
     proc_idx = next((i for i, ln in enumerate(lines) if re.match(r"(?i)^[ \t]*PROCEDURE[ \t]+DIVISION\b", ln)), None)
     if proc_idx is not None:
@@ -2811,20 +2831,22 @@ def _cobol_regex_extract(path: Path, deco: str, copybooks: list[str]) -> dict:
             if not m or m.group(1).upper() in _COBOL_NON_PARAGRAPH:
                 continue
             name = m.group(1)
-            nid = _make_id(prog, name)
+            owner_nid, owner_name = _prog_at(i + 1)
+            nid = _make_id(owner_name, name)
             _add(nid, name, f"L{i + 1}")
-            edges.append(_mf_edge(prog_nid, nid, "defines", str_path, f"L{i + 1}"))
+            edges.append(_mf_edge(owner_nid, nid, "defines", str_path, f"L{i + 1}"))
 
-    para_index = _cobol_para_index(nodes, file_nid, prog_nid)
+    para_index = _cobol_para_index(nodes, prog_nids_all | {file_nid})
 
     def _scope_at(line_no: int) -> str:
-        if not para_index:
-            return prog_nid
-        pos = bisect.bisect_right(para_index, (line_no, "￿")) - 1
-        return para_index[pos][1] if pos >= 0 else prog_nid
+        if para_index:
+            pos = bisect.bisect_right(para_index, (line_no, "￿")) - 1
+            if pos >= 0:
+                return para_index[pos][1]
+        return _prog_at(line_no)[0]
 
-    def _emit_call(line_no: int, target_nid: str, *, conf="EXTRACTED", score=1.0):
-        edges.append(_mf_edge(_scope_at(line_no), target_nid, "calls", str_path, f"L{line_no}",
+    def _emit_edge(line_no: int, target_nid: str, relation: str = "calls", *, conf="EXTRACTED", score=1.0):
+        edges.append(_mf_edge(_scope_at(line_no), target_nid, relation, str_path, f"L{line_no}",
                               conf=conf, score=score))
 
     # CALL 'literal'  (static program call). Skip matches inside string literals.
@@ -2837,16 +2859,29 @@ def _cobol_regex_extract(path: Path, deco: str, copybooks: list[str]) -> dict:
             continue
         tnid = _make_id(target)
         _add(tnid, target)
-        _emit_call(line_no, tnid)
+        _emit_edge(line_no, tnid)
+
+    # CANCEL 'literal'  (unloads a subprogram — a reference, not a call).
+    for m in re.finditer(r"(?i)\bCANCEL\b[ \t]+(?:'([^'\n]+)'|\"([^\"\n]+)\")", deco):
+        line_no = _line_no(m.start())
+        if not _quote_balanced_before(lines[line_no - 1], m.start() - line_starts[line_no - 1]):
+            continue
+        target = (m.group(1) or m.group(2)).strip()
+        if not target:
+            continue
+        tnid = _make_id(target)
+        _add(tnid, target)
+        _emit_edge(line_no, tnid, "references", conf="INFERRED", score=0.6)
 
     # PERFORM para [THRU/THROUGH para]   (only when followed by an identifier, not
     # an inline PERFORM body like "PERFORM 5 TIMES" or "PERFORM UNTIL ...").
     for m in re.finditer(r"(?i)\bPERFORM\b[ \t]+([A-Za-z0-9][\w$#@-]*)(?:[ \t]+(?:THRU|THROUGH)[ \t]+([A-Za-z0-9][\w$#@-]*))?", deco):
         line_no = _line_no(m.start())
+        _, owner_name = _prog_at(line_no)
         for g in (m.group(1), m.group(2)):
             if not g or g.upper() in _COBOL_NON_PROCEDURE or g.upper() in _COBOL_NON_PARAGRAPH:
                 continue
-            _emit_call(line_no, _make_id(prog, g))
+            _emit_edge(line_no, _make_id(owner_name, g))
 
     # GO TO para  (unconditional branch; treated as a weak call edge).
     for m in re.finditer(r"(?i)\bGO(?:[ \t]+TO|TO)\b[ \t]+([A-Za-z0-9][\w$#@-]*)", deco):
@@ -2854,7 +2889,7 @@ def _cobol_regex_extract(path: Path, deco: str, copybooks: list[str]) -> dict:
         g = m.group(1)
         if g.upper() in _COBOL_NON_PARAGRAPH or g.upper() == "DEPENDING":
             continue
-        _emit_call(line_no, _make_id(prog, g), conf="INFERRED", score=0.7)
+        _emit_edge(line_no, _make_id(_prog_at(line_no)[1], g), conf="INFERRED", score=0.7)
 
     # COPY members (also re-scanned here in case they survived the grammar strip).
     members = list(dict.fromkeys(copybooks))
@@ -2900,6 +2935,11 @@ def _cobol_regex_extract(path: Path, deco: str, copybooks: list[str]) -> dict:
                 name = mp.group(1).strip()
                 _add(_make_id("map", name), name, ftype="concept")
                 edges.append(_mf_edge(scope, _make_id("map", name), "uses", str_path, f"L{line_no}", conf="INFERRED", score=0.7))
+            ms = re.search(r"(?is)\bMAPSET\b[ \t]*\([ \t]*'([^'\n]+)'", body)
+            if ms:
+                name = ms.group(1).strip()
+                _add(_make_id(name), name)
+                edges.append(_mf_edge(scope, _make_id(name), "uses", str_path, f"L{line_no}", conf="INFERRED", score=0.6))
             fl = re.search(r"(?is)\b(?:FILE|DATASET)\b[ \t]*\([ \t]*'([^'\n]+)'", body)
             if fl:
                 name = fl.group(1).strip()
@@ -2992,7 +3032,16 @@ def extract_jcl(path: Path) -> dict:
     cur_proc: str | None = None  # in-stream PROC currently being defined
     cur_step_nid: str | None = None
     prev_was_dd = False
-    for i, raw in enumerate(src.splitlines()):
+    # A cataloged-procedure member (in a PROCLIB) is just steps — no JOB and often
+    # no //name PROC card. Treat the member name as a procedure so EXEC PROC=member
+    # references from other JCL link to it.
+    src_lines = src.splitlines()
+    if not any(re.match(r"^//\S+\s+JOB\b", x) or re.match(r"^//\S+\s+PROC\b", x) for x in src_lines):
+        cur_proc = stem
+        pid = _make_id(stem)
+        _add(pid, stem, "L1")
+        edges.append(_mf_edge(file_nid, pid, "defines", str_path, "L1"))
+    for i, raw in enumerate(src_lines):
         ln = raw.rstrip()
         if ln.startswith("//*") or not ln.startswith("//"):
             prev_was_dd = False
@@ -3171,6 +3220,358 @@ def extract_rexx(path: Path) -> dict:
         line = f"L{clean.count(chr(10), 0, m.start()) + 1}"
         edges.append(_mf_edge(file_nid, nid, "calls", str_path, line, conf="INFERRED", score=0.7))
 
+    return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
+
+
+# ── HLASM (IBM High Level Assembler / mainframe assembler) ────────────────────
+
+def _hlasm_lines(src: str) -> list[str]:
+    """Return HLASM source with the columns-73-80 identification field removed and
+    full-line comments (``*`` in column 1, ``.*`` open-code macro comments) blanked
+    out — newlines preserved so offsets/line numbers stay aligned."""
+    out = []
+    for ln in src.splitlines():
+        s = ln[:72] if len(ln) > 72 else ln
+        st = s.lstrip()
+        out.append("" if (s[:1] == "*" or st[:2] == ".*") else s.rstrip())
+    return out
+
+
+def extract_hlasm(path: Path) -> dict:
+    """Extract control sections (CSECT/RSECT/DSECT/START/COM), macro definitions,
+    ENTRY/EXTRN linkage, COPY includes, ``=V(...)``/``=A(...)`` external address
+    constants, and program-invocation macros (CALL / LINK / XCTL / ATTACH / LOAD ...)
+    from an IBM High Level Assembler (HLASM, mainframe assembler) source file."""
+    try:
+        src = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"error": f"cannot read {path}"}
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    nodes: list[dict] = [_mf_node(file_nid, path.name, str_path)]
+    edges: list[dict] = []
+    seen: set[str] = {file_nid}
+
+    def _add(nid: str, label: str, loc: str | None = None, ftype: str = "code") -> None:
+        if nid not in seen:
+            nodes.append(_mf_node(nid, label, str_path, loc, ftype))
+            seen.add(nid)
+
+    lines = _hlasm_lines(src)
+    text = "\n".join(lines)
+    line_starts = [0]
+    for ln in lines:
+        line_starts.append(line_starts[-1] + len(ln) + 1)
+
+    def _line_no(idx: int) -> int:
+        return bisect.bisect_right(line_starts, idx)
+
+    sect_index: list[tuple[int, str]] = []  # (line, control-section node id)
+    in_macro = False
+    pending_proto = False
+    for i, ln in enumerate(lines):
+        if pending_proto and ln.strip():
+            pm = re.match(r"^(?:[A-Za-z@#$&][\w@#$&]*)?\s+([A-Za-z@#$][\w@#$]*)", ln)
+            if pm:
+                nid = _make_id(pm.group(1))
+                _add(nid, pm.group(1), f"L{i + 1}")
+                edges.append(_mf_edge(file_nid, nid, "defines", str_path, f"L{i + 1}"))
+            pending_proto = False
+            continue
+        if re.match(r"^\s+MACRO\s*$", ln) or ln.strip().upper() == "MACRO":
+            in_macro = True
+            pending_proto = True
+            continue
+        if re.match(r"^\s+MEND\b", ln):
+            in_macro = False
+            continue
+        if in_macro:
+            continue
+        m = re.match(r"^([A-Za-z@#$][\w@#$]*)\s+(CSECT|RSECT|DSECT|START|COM)\b", ln)
+        if m:
+            nid = _make_id(m.group(1))
+            _add(nid, m.group(1), f"L{i + 1}")
+            edges.append(_mf_edge(file_nid, nid, "defines", str_path, f"L{i + 1}"))
+            sect_index.append((i + 1, nid))
+
+    def _scope_at(line_no: int) -> str:
+        if not sect_index:
+            return file_nid
+        pos = bisect.bisect_right(sect_index, (line_no, "￿")) - 1
+        return sect_index[pos][1] if pos >= 0 else file_nid
+
+    def _names(raw: str):
+        for n in re.split(r"[,()\s]+", raw.strip()):
+            if n and re.match(r"^[A-Za-z@#$][\w@#$]*$", n):
+                yield n
+
+    # ENTRY name[,name...]  → this module defines/exports those entry points.
+    for m in re.finditer(r"(?im)^(?:[A-Za-z@#$][\w@#$]*)?[ \t]+ENTRY[ \t]+([A-Za-z@#$][\w@#$,() \t]*)", text):
+        for name in _names(m.group(1)):
+            nid = _make_id(name)
+            _add(nid, name)
+            edges.append(_mf_edge(_scope_at(_line_no(m.start())), nid, "defines", str_path, f"L{_line_no(m.start())}"))
+    # EXTRN / WXTRN name[,...]  → external symbols this module references.
+    for m in re.finditer(r"(?im)^(?:[A-Za-z@#$][\w@#$]*)?[ \t]+W?XTRN[ \t]+([A-Za-z@#$][\w@#$,() \t]*)", text):
+        for name in _names(m.group(1)):
+            nid = _make_id(name)
+            _add(nid, name)
+            edges.append(_mf_edge(_scope_at(_line_no(m.start())), nid, "calls", str_path, f"L{_line_no(m.start())}", conf="INFERRED", score=0.6))
+    # COPY member  → assembler source/macro include.
+    for m in re.finditer(r"(?im)^(?:[A-Za-z@#$][\w@#$]*)?[ \t]+COPY[ \t]+([A-Za-z@#$][\w@#$]*)", text):
+        nid = _make_id(m.group(1))
+        _add(nid, m.group(1))
+        edges.append(_mf_edge(file_nid, nid, "includes", str_path, f"L{_line_no(m.start())}"))
+    # =V(NAME) / =A(NAME) external address constants → external routine reference.
+    for m in re.finditer(r"=[VA]\(([A-Za-z@#$][\w@#$]*)\)", text):
+        nid = _make_id(m.group(1))
+        _add(nid, m.group(1))
+        edges.append(_mf_edge(_scope_at(_line_no(m.start())), nid, "calls", str_path, f"L{_line_no(m.start())}", conf="INFERRED", score=0.6))
+    # CALL name,...  (the assembler CALL macro — first positional operand is the program/entry)
+    for m in re.finditer(r"(?im)^(?:[A-Za-z@#$][\w@#$]*)?[ \t]+CALL[ \t]+([A-Za-z@#$][\w@#$]*)", text):
+        name = m.group(1)
+        if name.upper() in ("EP", "EPLOC", "DE", "VL", "MF", "SF", "ID", "LIST"):
+            continue
+        nid = _make_id(name)
+        _add(nid, name)
+        edges.append(_mf_edge(_scope_at(_line_no(m.start())), nid, "calls", str_path, f"L{_line_no(m.start())}"))
+    # LINK/XCTL/ATTACH/LOAD/...  EP=name  (the only operand form we can resolve)
+    for m in re.finditer(r"(?im)^(?:[A-Za-z@#$][\w@#$]*)?[ \t]+(?:LINK|LINKX|XCTL|XCTLX|ATTACH|ATTACHX|LOAD|CDLOAD|SYNCH|SYNCHX)\b[^\n]*?\bEP=([A-Za-z@#$][\w@#$]*)", text):
+        nid = _make_id(m.group(1))
+        _add(nid, m.group(1))
+        edges.append(_mf_edge(_scope_at(_line_no(m.start())), nid, "calls", str_path, f"L{_line_no(m.start())}"))
+
+    return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
+
+
+# ── IMS DBD / PSB source ─────────────────────────────────────────────────────
+
+def _ims_logical_statements(src: str) -> list[tuple[int, str]]:
+    """Join HLASM-style continuation lines (non-blank in column 72 → continued at
+    column 16 of the next line) and drop comments. Returns (first-line-no, statement)."""
+    out: list[tuple[int, str]] = []
+    cur, cur_line = "", 0
+    for i, ln in enumerate(src.splitlines()):
+        body = ln[:71]
+        cont = len(ln) > 71 and ln[71:72].strip() != ""
+        if not cur and body.lstrip()[:1] == "*":
+            continue
+        if not cur:
+            cur_line = i + 1
+        cur += (" " + body.strip()) if cur else body.strip()
+        if not cont:
+            if cur.strip():
+                out.append((cur_line, cur.strip()))
+            cur = ""
+    if cur.strip():
+        out.append((cur_line, cur.strip()))
+    return out
+
+
+def _ims_kv(stmt: str) -> dict[str, str]:
+    return {k.upper(): v.strip("()'") for k, v in re.findall(r"([A-Za-z][\w]*)\s*=\s*([A-Za-z0-9@#$.()'\-]+)", stmt)}
+
+
+def extract_ims(path: Path) -> dict:
+    """Extract IMS database structure from a DBD (Database Description) or PSB
+    (Program Specification Block) source member: databases, segments and their
+    parent hierarchy, PCBs and their target databases / sensitive segments."""
+    try:
+        src = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"error": f"cannot read {path}"}
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    nodes: list[dict] = [_mf_node(file_nid, path.name, str_path)]
+    edges: list[dict] = []
+    seen: set[str] = {file_nid}
+
+    def _add(nid: str, label: str, loc: str | None = None, ftype: str = "concept") -> None:
+        if nid not in seen:
+            nodes.append(_mf_node(nid, label, str_path, loc, ftype))
+            seen.add(nid)
+
+    cur_db_name: str | None = None
+    cur_seg_name: str | None = None
+    cur_pcb_nid: str | None = None
+    cur_pcb_dbname: str | None = None
+    pcb_n = 0
+    stem = _file_stem(path).split(".")[-1]
+
+    def _seg_nid(dbname: str, segname: str) -> str:
+        return _make_id("seg", dbname, segname)
+
+    _IMS_KEYWORDS = {"DBD", "DATASET", "AREA", "SEGM", "FIELD", "LCHILD", "XDFLD", "DFSMARSH",
+                     "PCB", "SENSEG", "SENFLD", "PSBGEN", "DBDGEN", "ACCESS"}
+    for line_no, stmt in _ims_logical_statements(src):
+        toks = stmt.split(None, 2)
+        # Statements are usually "<blanks>KEYWORD operands"; tolerate an optional label.
+        if toks and toks[0].upper() in _IMS_KEYWORDS:
+            kw = toks[0].upper()
+        elif len(toks) > 1 and toks[1].upper() in _IMS_KEYWORDS:
+            kw = toks[1].upper()
+        else:
+            continue
+        kv = _ims_kv(stmt)
+        loc = f"L{line_no}"
+        if kw == "DBD":
+            cur_db_name = (kv.get("NAME") or "").split(",")[0].strip()
+            cur_seg_name = None
+            if cur_db_name:
+                dn = _make_id("dbd", cur_db_name)
+                _add(dn, cur_db_name, loc)
+                edges.append(_mf_edge(file_nid, dn, "defines", str_path, loc))
+        elif kw == "SEGM" and cur_db_name:
+            name = (kv.get("NAME") or "").split(",")[0].strip()
+            if not name:
+                continue
+            cur_seg_name = name
+            snid = _seg_nid(cur_db_name, name)
+            _add(snid, name, loc)
+            parent = (kv.get("PARENT") or "0").split(",")[0].strip().strip("()")
+            if parent and parent != "0":
+                pnid = _seg_nid(cur_db_name, parent)
+                _add(pnid, parent)
+                edges.append(_mf_edge(pnid, snid, "contains", str_path, loc))
+            else:
+                edges.append(_mf_edge(_make_id("dbd", cur_db_name), snid, "contains", str_path, loc))
+        elif kw == "LCHILD" and cur_db_name and cur_seg_name:
+            name = (kv.get("NAME") or "").split(",")[0].strip()
+            if name:
+                cnid = _seg_nid(cur_db_name, name)
+                _add(cnid, name)
+                edges.append(_mf_edge(_seg_nid(cur_db_name, cur_seg_name), cnid, "references", str_path, loc, conf="INFERRED", score=0.6))
+        elif kw == "PCB":
+            pcb_n += 1
+            pcbname = (kv.get("PCBNAME") or "").strip()
+            cur_pcb_nid = _make_id("pcb", pcbname) if pcbname else _make_id("pcb", stem, str(pcb_n))
+            _add(cur_pcb_nid, pcbname or f"PCB{pcb_n}", loc)
+            edges.append(_mf_edge(file_nid, cur_pcb_nid, "defines", str_path, loc))
+            cur_pcb_dbname = (kv.get("DBDNAME") or kv.get("NAME") or "").split(",")[0].strip() or None
+            if cur_pcb_dbname:
+                tn = _make_id("dbd", cur_pcb_dbname)
+                _add(tn, cur_pcb_dbname)
+                edges.append(_mf_edge(cur_pcb_nid, tn, "uses", str_path, loc))
+        elif kw == "SENSEG" and cur_pcb_nid:
+            name = (kv.get("NAME") or "").split(",")[0].strip()
+            if name and cur_pcb_dbname:
+                snid = _seg_nid(cur_pcb_dbname, name)
+                _add(snid, name)
+                edges.append(_mf_edge(cur_pcb_nid, snid, "uses", str_path, loc, conf="INFERRED", score=0.8))
+        elif kw == "PSBGEN":
+            psbname = (kv.get("PSBNAME") or "").strip()
+            if psbname:
+                pn = _make_id(psbname)
+                _add(pn, psbname, loc, ftype="code")
+                edges.append(_mf_edge(file_nid, pn, "defines", str_path, loc))
+
+    return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
+
+
+# ── CICS BMS (Basic Mapping Support) map source ──────────────────────────────
+
+def extract_bms(path: Path) -> dict:
+    """Extract CICS BMS mapset / map structure (DFHMSD mapsets and DFHMDI maps)
+    from a BMS macro source file. Map nodes use the same id scheme as COBOL
+    ``EXEC CICS SEND/RECEIVE MAP(...)`` references, so screen flow links up."""
+    try:
+        src = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"error": f"cannot read {path}"}
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    nodes: list[dict] = [_mf_node(file_nid, path.name, str_path)]
+    edges: list[dict] = []
+    seen: set[str] = {file_nid}
+
+    def _add(nid: str, label: str, loc: str | None = None, ftype: str = "code") -> None:
+        if nid not in seen:
+            nodes.append(_mf_node(nid, label, str_path, loc, ftype))
+            seen.add(nid)
+
+    cur_mapset: str | None = None
+    for line_no, stmt in _ims_logical_statements(src):
+        m = re.match(r"^([A-Za-z@#$][\w@#$]*)?\s+(DFHMSD|DFHMDI)\b", stmt)
+        if not m:
+            continue
+        label, macro = m.group(1), m.group(2).upper()
+        loc = f"L{line_no}"
+        if macro == "DFHMSD":
+            if re.search(r"\bTYPE\s*=\s*&?\(?\s*FINAL", stmt, re.I):
+                cur_mapset = None
+                continue
+            if label:
+                cur_mapset = _make_id(label)
+                _add(cur_mapset, label, loc)
+                edges.append(_mf_edge(file_nid, cur_mapset, "defines", str_path, loc))
+        elif macro == "DFHMDI" and label:
+            mnid = _make_id("map", label)
+            _add(mnid, label, loc, ftype="concept")
+            edges.append(_mf_edge(cur_mapset or file_nid, mnid, "defines", str_path, loc))
+    return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
+
+
+# ── DB2 / SQL DDL ────────────────────────────────────────────────────────────
+
+def extract_ddl(path: Path) -> dict:
+    """Extract DDL objects (tables, views, indexes, procedures, triggers,
+    tablespaces, ...) and foreign-key references. Uses the tree-sitter SQL
+    extractor when ``tree-sitter-sql`` is installed; otherwise a dependency-free
+    regex extractor that also understands DB2-specific ``CREATE`` statements."""
+    r = extract_sql(path)
+    if "error" not in r:
+        return r
+    try:
+        src = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"error": f"cannot read {path}"}
+    clean = re.sub(r"--[^\n]*", "", src)
+    clean = re.sub(r"/\*.*?\*/", lambda m: _blank_keep_newlines(m.group(0)), clean, flags=re.S)
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    nodes: list[dict] = [_mf_node(file_nid, path.name, str_path)]
+    edges: list[dict] = []
+    seen: set[str] = {file_nid}
+
+    def _add(nid: str, label: str, loc: str | None = None, ftype: str = "code") -> None:
+        if nid not in seen:
+            nodes.append(_mf_node(nid, label, str_path, loc, ftype))
+            seen.add(nid)
+
+    def _line(idx: int) -> str:
+        return f"L{clean.count(chr(10), 0, idx) + 1}"
+
+    def _qn(raw: str) -> str:
+        return raw.strip().strip('"').strip()
+
+    _OBJ_RE = (r"(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW|TABLESPACE|STOGROUP|DATABASE|"
+               r"INDEX|UNIQUE\s+INDEX|ALIAS|SYNONYM|PROCEDURE|FUNCTION|TRIGGER|SEQUENCE|TYPE)\s+"
+               r"(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_\"][\w\".$#@-]*)")
+    creates: list[tuple[int, str]] = []  # (offset, qualified table name) for FK source resolution
+    for m in re.finditer(_OBJ_RE, clean):
+        kind = re.sub(r"\s+", " ", m.group(1).upper())
+        name = _qn(m.group(2))
+        is_relation = kind in ("TABLE", "VIEW", "ALIAS", "SYNONYM", "SEQUENCE")
+        ftype = "concept" if is_relation or kind in ("TABLESPACE", "STOGROUP", "DATABASE", "INDEX", "UNIQUE INDEX") else "code"
+        prefix = "tbl" if is_relation else kind.split()[-1].lower()
+        nid = _make_id(prefix, name)
+        _add(nid, name, _line(m.start()), ftype=ftype)
+        edges.append(_mf_edge(file_nid, nid, "defines", str_path, _line(m.start())))
+        if kind == "TABLE":
+            creates.append((m.start(), name))
+        if kind in ("INDEX", "UNIQUE INDEX", "TRIGGER"):
+            on = re.search(r"\bON\s+([A-Za-z_\"][\w\".$#@-]*)", clean[m.end():m.end() + 300])
+            if on:
+                tn = _make_id("tbl", _qn(on.group(1)))
+                _add(tn, _qn(on.group(1)), ftype="concept")
+                edges.append(_mf_edge(nid, tn, "references", str_path, _line(m.start()), conf="INFERRED", score=0.7))
+    for m in re.finditer(r"(?is)\bREFERENCES\s+([A-Za-z_\"][\w\".$#@-]*)", clean):
+        tgt = _qn(m.group(1))
+        tn = _make_id("tbl", tgt)
+        _add(tn, tgt, ftype="concept")
+        src_name = next((nm for off, nm in reversed(creates) if off < m.start()), None)
+        src_nid = _make_id("tbl", src_name) if src_name else file_nid
+        edges.append(_mf_edge(src_nid, tn, "references", str_path, _line(m.start()), conf="INFERRED", score=0.8))
     return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
 
 
@@ -6312,11 +6713,20 @@ _DISPATCH: dict[str, Any] = {
     ".copy": extract_copybook,
     ".cbk": extract_copybook,
     ".jcl": extract_jcl,
+    ".proc": extract_jcl,
     ".pli": extract_pli,
     ".pl1": extract_pli,
     ".rexx": extract_rexx,
     ".rex": extract_rexx,
-    ".ddl": extract_sql,
+    ".asm": extract_hlasm,
+    ".mlc": extract_hlasm,
+    ".hlasm": extract_hlasm,
+    ".assemble": extract_hlasm,
+    ".dbd": extract_ims,
+    ".psb": extract_ims,
+    ".bms": extract_bms,
+    ".mapset": extract_bms,
+    ".ddl": extract_ddl,
 }
 
 
