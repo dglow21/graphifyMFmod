@@ -2461,6 +2461,15 @@ _COBOL_NON_PARAGRAPH = frozenset({
 _SQL_NON_TABLE = frozenset({"TABLE", "LATERAL", "ONLY", "FINAL", "OLD", "NEW", "SELECT", "VALUES", "DUAL"})
 
 
+def _sql_table_id(name: str) -> str:
+    """Stable, file-independent node id for a SQL/DB2 table or view, keyed on the
+    unqualified (short) name. Lets embedded ``EXEC SQL`` references in COBOL link
+    to the DDL that defines the table, and cross-file foreign keys resolve, even
+    though COBOL often uses the unqualified name while DDL is schema-qualified."""
+    short = name.strip().strip("\"'`[]").split(".")[-1].strip("\"'`[]")
+    return _make_id("tbl", short)
+
+
 def _blank_keep_newlines(text: str) -> str:
     return re.sub(r"[^\n]", " ", text)
 
@@ -2921,7 +2930,7 @@ def _cobol_regex_extract(path: Path, deco: str, copybooks: list[str]) -> dict:
                 tbl = tm.group(1)
                 if tbl.split(".")[-1].upper() in _SQL_NON_TABLE:
                     continue
-                tnid = _make_id("tbl", tbl)
+                tnid = _sql_table_id(tbl)
                 _add(tnid, tbl, ftype="concept")
                 edges.append(_mf_edge(scope, tnid, "uses", str_path, f"L{line_no}", conf="INFERRED", score=0.7))
         elif kind == "CICS":
@@ -3087,7 +3096,18 @@ def extract_jcl(path: Path) -> dict:
             edges.append(_mf_edge(owner_nid, cur_step_nid, "defines", str_path, loc))
             pgm = re.search(r"\bPGM=([A-Z0-9#@$.]+)", operands, re.I)
             proc = re.search(r"\bPROC=([A-Z0-9#@$.]+)", operands, re.I)
-            if pgm:
+            ims = re.search(r"\bPARM=[('\"]*\s*(?:DLI|DBB)\s*,\s*([A-Z0-9#@$]+)\s*,\s*([A-Z0-9#@$]+)", operands, re.I) \
+                if pgm and pgm.group(1).upper() in ("DFSRRC00", "DFSRRC10") else None
+            if ims:
+                # IMS batch/BMP region controller: PARM=(DLI,appprogram,psb,...)
+                app, psb = ims.group(1), ims.group(2)
+                an = _make_id(app)
+                _add(an, app)
+                edges.append(_mf_edge(cur_step_nid, an, "executes", str_path, loc))
+                pn = _make_id(psb)
+                _add(pn, psb)
+                edges.append(_mf_edge(an, pn, "uses", str_path, loc, conf="INFERRED", score=0.8))
+            elif pgm:
                 tn = _make_id(pgm.group(1))
                 _add(tn, pgm.group(1))
                 edges.append(_mf_edge(cur_step_nid, tn, "executes", str_path, loc))
@@ -3397,6 +3417,19 @@ def extract_ims(path: Path) -> dict:
     cur_pcb_dbname: str | None = None
     pcb_n = 0
     stem = _file_stem(path).split(".")[-1]
+    # The PSB's identity is its member name (= file stem); that is what JCL
+    # `PARM=(DLI,prog,psb)` and the program reference. Created lazily on the first
+    # PCB/PSBGEN so program → PSB → PCB → DBD → segment resolves across files.
+    psb_nid = _make_id(stem)
+    psb_created = False
+
+    def _ensure_psb(loc: str | None = None) -> str:
+        nonlocal psb_created
+        if not psb_created:
+            psb_created = True
+            _add(psb_nid, stem, loc, ftype="code")
+            edges.append(_mf_edge(file_nid, psb_nid, "defines", str_path, loc))
+        return psb_nid
 
     def _seg_nid(dbname: str, segname: str) -> str:
         return _make_id("seg", dbname, segname)
@@ -3446,7 +3479,7 @@ def extract_ims(path: Path) -> dict:
             pcbname = (kv.get("PCBNAME") or "").strip()
             cur_pcb_nid = _make_id("pcb", pcbname) if pcbname else _make_id("pcb", stem, str(pcb_n))
             _add(cur_pcb_nid, pcbname or f"PCB{pcb_n}", loc)
-            edges.append(_mf_edge(file_nid, cur_pcb_nid, "defines", str_path, loc))
+            edges.append(_mf_edge(_ensure_psb(loc), cur_pcb_nid, "contains", str_path, loc))
             cur_pcb_dbname = (kv.get("DBDNAME") or kv.get("NAME") or "").split(",")[0].strip() or None
             if cur_pcb_dbname:
                 tn = _make_id("dbd", cur_pcb_dbname)
@@ -3459,11 +3492,13 @@ def extract_ims(path: Path) -> dict:
                 _add(snid, name)
                 edges.append(_mf_edge(cur_pcb_nid, snid, "uses", str_path, loc, conf="INFERRED", score=0.8))
         elif kw == "PSBGEN":
+            _ensure_psb(loc)
             psbname = (kv.get("PSBNAME") or "").strip()
-            if psbname:
-                pn = _make_id(psbname)
-                _add(pn, psbname, loc, ftype="code")
-                edges.append(_mf_edge(file_nid, pn, "defines", str_path, loc))
+            if psbname:  # prefer the declared PSB name as the label
+                for n in nodes:
+                    if n["id"] == psb_nid:
+                        n["label"] = psbname
+                        break
 
     return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
 
@@ -3553,8 +3588,7 @@ def extract_ddl(path: Path) -> dict:
         name = _qn(m.group(2))
         is_relation = kind in ("TABLE", "VIEW", "ALIAS", "SYNONYM", "SEQUENCE")
         ftype = "concept" if is_relation or kind in ("TABLESPACE", "STOGROUP", "DATABASE", "INDEX", "UNIQUE INDEX") else "code"
-        prefix = "tbl" if is_relation else kind.split()[-1].lower()
-        nid = _make_id(prefix, name)
+        nid = _sql_table_id(name) if is_relation else _make_id(kind.split()[-1].lower(), name)
         _add(nid, name, _line(m.start()), ftype=ftype)
         edges.append(_mf_edge(file_nid, nid, "defines", str_path, _line(m.start())))
         if kind == "TABLE":
@@ -3562,15 +3596,15 @@ def extract_ddl(path: Path) -> dict:
         if kind in ("INDEX", "UNIQUE INDEX", "TRIGGER"):
             on = re.search(r"\bON\s+([A-Za-z_\"][\w\".$#@-]*)", clean[m.end():m.end() + 300])
             if on:
-                tn = _make_id("tbl", _qn(on.group(1)))
+                tn = _sql_table_id(on.group(1))
                 _add(tn, _qn(on.group(1)), ftype="concept")
                 edges.append(_mf_edge(nid, tn, "references", str_path, _line(m.start()), conf="INFERRED", score=0.7))
     for m in re.finditer(r"(?is)\bREFERENCES\s+([A-Za-z_\"][\w\".$#@-]*)", clean):
         tgt = _qn(m.group(1))
-        tn = _make_id("tbl", tgt)
+        tn = _sql_table_id(tgt)
         _add(tn, tgt, ftype="concept")
         src_name = next((nm for off, nm in reversed(creates) if off < m.start()), None)
-        src_nid = _make_id("tbl", src_name) if src_name else file_nid
+        src_nid = _sql_table_id(src_name) if src_name else file_nid
         edges.append(_mf_edge(src_nid, tn, "references", str_path, _line(m.start()), conf="INFERRED", score=0.8))
     return {"nodes": nodes, "edges": _mf_self_consistent(nodes, edges)}
 
@@ -3735,31 +3769,37 @@ def extract_sql(path: Path) -> dict:
         if t == "create_table":
             name = _obj_name(node)
             if name:
-                nid = _make_id(stem, name)
+                nid = _sql_table_id(name)
                 _add_node(nid, name, line)
                 table_nids[name.lower()] = nid
-                # Foreign key REFERENCES
+                # Foreign keys: both column-level (REFERENCES on a column_definition)
+                # and table-level (FOREIGN KEY ... REFERENCES in a constraints block).
+                def _refs_in(container) -> None:
+                    for cd in container.children:
+                        if cd.type == "constraints":
+                            _refs_in(cd)
+                            continue
+                        if cd.type not in ("column_definition", "constraint"):
+                            continue
+                        ref_name: str | None = None
+                        found_ref = False
+                        for cc in cd.children:
+                            if cc.type == "keyword_references":
+                                found_ref = True
+                            elif found_ref and cc.type == "object_reference":
+                                ref_name = _read(cc)
+                                break
+                        if ref_name:
+                            _add_edge(nid, _sql_table_id(ref_name), "references", line)
+
                 for col in node.children:
                     if col.type == "column_definitions":
-                        for cd in col.children:
-                            if cd.type != "column_definition":
-                                continue
-                            ref_name: str | None = None
-                            found_ref = False
-                            for cc in cd.children:
-                                if cc.type == "keyword_references":
-                                    found_ref = True
-                                elif found_ref and cc.type == "object_reference":
-                                    ref_name = _read(cc)
-                                    break
-                            if ref_name:
-                                ref_nid = _make_id(stem, ref_name)
-                                _add_edge(nid, ref_nid, "references", line)
+                        _refs_in(col)
 
         elif t == "create_view":
             name = _obj_name(node)
             if name:
-                nid = _make_id(stem, name)
+                nid = _sql_table_id(name)
                 _add_node(nid, name, line)
                 table_nids[name.lower()] = nid
                 # FROM/JOIN table references inside view body
@@ -3784,7 +3824,7 @@ def extract_sql(path: Path) -> dict:
             if name:
                 src_nid = table_nids.get(name.lower())
                 if not src_nid:
-                    src_nid = _make_id(stem, name)
+                    src_nid = _sql_table_id(name)
                     _add_node(src_nid, name, line)
                     table_nids[name.lower()] = src_nid
                 for child in node.children:
@@ -3803,7 +3843,7 @@ def extract_sql(path: Path) -> dict:
                             if ref_name:
                                 ref_nid = table_nids.get(ref_name.lower())
                                 if not ref_nid:
-                                    ref_nid = _make_id(stem, ref_name)
+                                    ref_nid = _sql_table_id(ref_name)
                                 _add_edge(src_nid, ref_nid, "references", line)
 
         for child in node.children:
@@ -3817,7 +3857,7 @@ def extract_sql(path: Path) -> dict:
                     for cc in c.children:
                         if cc.type == "object_reference":
                             tbl = _read(cc)
-                            tbl_nid = _make_id(stem, tbl)
+                            tbl_nid = _sql_table_id(tbl)
                             _add_edge(caller_nid, tbl_nid, "reads_from",
                                       c.start_point[0] + 1)
         for child in node.children:

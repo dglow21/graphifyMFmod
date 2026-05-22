@@ -464,6 +464,98 @@ def test_bms_map_id_matches_cobol_send_map():
     assert confmap["id"] == _make_id("map", "CONFMAP")
 
 
+# ── COBOL embedded-SQL ↔ DDL linking ─────────────────────────────────────────
+
+def test_cobol_exec_sql_links_to_ddl(tmp_path):
+    from graphify.extract import extract
+    from graphify.build import build_from_json
+    (tmp_path / "PROG.cbl").write_text(
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. PROG.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       0100-READ.\n"
+        "           EXEC SQL SELECT NAME INTO :WS-N FROM CUSTOMER END-EXEC.\n"
+    )
+    # DDL uses a schema-qualified name; COBOL uses the unqualified name — they
+    # must still resolve to the same table node.
+    (tmp_path / "schema.ddl").write_text(
+        "CREATE TABLE APP.CUSTOMER (CUST_ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(40));\n"
+    )
+    ex = extract([tmp_path / "PROG.cbl", tmp_path / "schema.ddl"], cache_root=tmp_path, parallel=False)
+    G = build_from_json(ex, directed=True)
+    lab = {n: d.get("label") for n, d in G.nodes(data=True)}
+    edges = {(lab.get(s), d.get("relation"), lab.get(t)) for s, t, d in G.edges(data=True)}
+    # The COBOL 'uses' edge and the DDL 'contains'/'defines' edge point at one node.
+    from graphify.extract import _sql_table_id
+    tid = _sql_table_id("CUSTOMER")
+    assert tid in G.nodes
+    assert G.in_degree(tid) + G.out_degree(tid) >= 2
+    assert any(rel == "uses" and t for s, rel, t in edges if t == lab.get(tid))
+
+
+def test_sql_table_id_is_schema_independent():
+    from graphify.extract import _sql_table_id
+    assert _sql_table_id("CUSTOMER") == _sql_table_id("APP.CUSTOMER")
+    assert _sql_table_id('"App"."Customer"') == _sql_table_id("customer")
+
+
+# ── IMS: JCL → program → PSB → PCB → DBD → segment chain ──────────────────────
+
+def test_ims_program_to_segment_chain(tmp_path):
+    from graphify.extract import extract
+    from graphify.build import build_from_json
+    import networkx as nx
+    (tmp_path / "CUSTINQ.cbl").write_text(
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. CUSTINQ.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       MAIN-PARA.\n"
+        "           CALL 'CBLTDLI' USING GU, PCB1, IO-AREA.\n"
+    )
+    (tmp_path / "CUSTPSB.psb").write_text(
+        "         PCB   TYPE=DB,DBDNAME=CUSTDB,PROCOPT=GO\n"
+        "         SENSEG NAME=CUSTOMER,PARENT=0\n"
+        "         PSBGEN PSBNAME=CUSTPSB,LANG=COBOL\n"
+        "         END\n"
+    )
+    (tmp_path / "CUSTDB.dbd").write_text(
+        "         DBD   NAME=CUSTDB,ACCESS=(HDAM,OSAM)\n"
+        "         SEGM  NAME=CUSTOMER,PARENT=0,BYTES=80\n"
+        "         DBDGEN\n"
+        "         END\n"
+    )
+    (tmp_path / "RUNINQ.jcl").write_text(
+        "//RUNINQ   JOB (ACCT),'IMS',CLASS=A\n"
+        "//STEP1    EXEC PGM=DFSRRC00,PARM=(DLI,CUSTINQ,CUSTPSB)\n"
+    )
+    ex = extract(sorted(tmp_path.glob("*")), cache_root=tmp_path, parallel=False)
+    G = build_from_json(ex, directed=True)
+    lab = {n: d.get("label") for n, d in G.nodes(data=True)}
+    prog = next(n for n, l in lab.items() if l == "CUSTINQ")
+    reachable = {lab.get(x) for x in nx.descendants(G, prog)}
+    # From the program we can trace through the PSB, PCB, DBD, to the segment.
+    for expected in ("CUSTPSB", "CUSTDB", "CUSTOMER"):
+        assert expected in reachable, f"{expected} not reachable from CUSTINQ: {reachable}"
+    # And the JCL step executes the program.
+    edges = {(lab.get(s), d.get("relation"), lab.get(t)) for s, t, d in G.edges(data=True)}
+    assert ("STEP1", "executes", "CUSTINQ") in edges
+
+
+def test_jcl_imsbatch_parm_links_program_and_psb():
+    # DFSRRC00 PARM=(DLI,pgm,psb) yields program executes + program→PSB uses edges.
+    import tempfile, os
+    from graphify.extract import extract_jcl
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "j.jcl")
+        with open(p, "w") as f:
+            f.write("//J JOB 1\n//S EXEC PGM=DFSRRC00,PARM=(DLI,MYPGM,MYPSB)\n")
+        r = extract_jcl(__import__("pathlib").Path(p))
+    by = {n["id"]: n["label"] for n in r["nodes"]}
+    edges = {(by.get(e["source"], e["source"]), e["relation"], by.get(e["target"], e["target"])) for e in r["edges"]}
+    assert any(t == "MYPGM" and rel == "executes" for _, rel, t in edges)
+    assert any(s == "MYPGM" and t == "MYPSB" and rel == "uses" for s, rel, t in edges)
+
+
 # ── DB2 / SQL DDL ─────────────────────────────────────────────────────────────
 
 def test_ddl_extracts_tables():
